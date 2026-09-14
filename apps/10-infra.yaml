@@ -1,0 +1,628 @@
+# NiCo stack, infrastructure steps (00-08). Catalog Apps referenced by stacktemplates/nico-site.yaml.
+# Steps that need cross-namespace kubectl are manifests Apps carrying their own hook Job, ServiceAccount
+# and ClusterRoleBinding: a `bash` App on a cluster destination only gets a namespaced RoleBinding.
+---
+apiVersion: management.loft.sh/v1
+kind: App
+metadata:
+  name: nico-step-00-namespaces
+  labels: {nico.vcluster.com/stack: "true"}
+spec:
+  displayName: "[NiCo 00] Namespaces"
+  description: Owns the namespaces the later steps deploy into (forge-system holds the Core chart legacy-alias Services it does not create itself), so deleting the stack removes them. nico-system is owned by the prereqs chart.
+  defaultNamespace: default
+  wait: true
+  timeout: 2m
+  config:
+    manifests: |
+      {{- range list "vault" "postgres" "external-secrets" "temporal" "nico-rest" "forge-system" }}
+      ---
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: {{ . }}
+        labels:
+          nico.vcluster.com/stack: "true"
+      {{- end }}
+---
+apiVersion: management.loft.sh/v1
+kind: App
+metadata:
+  name: nico-step-01-postgres-operator
+  labels: {nico.vcluster.com/stack: "true"}
+spec:
+  displayName: "[NiCo 01] Zalando postgres-operator"
+  defaultNamespace: postgres
+  wait: true
+  timeout: 10m
+  config:
+    chart:
+      name: postgres-operator
+      version: "1.11.0"
+      repoURL: https://opensource.zalando.com/postgres-operator/charts/postgres-operator
+    values: |
+      configTarget: ConfigMap
+      configKubernetes:
+        # nico-prereqs creates this ConfigMap; the operator injects it into every postgres pod.
+        pod_environment_configmap: "postgres/nico-pg-cluster-env"
+---
+apiVersion: management.loft.sh/v1
+kind: App
+metadata:
+  name: nico-step-02-lb
+  labels: {nico.vcluster.com/stack: "true"}
+spec:
+  displayName: "[NiCo 02] LoadBalancer addressing"
+  description: "lbMode=cilium: an L2 policy announcing nico-system VIPs only from the edge node that runs nico-api/pxe/dhcp (externalTrafficPolicy=Local); your default policy must exclude nico-system. lbMode=metallb: address pools and an L2Advertisement (untested)."
+  defaultNamespace: default
+  wait: true
+  timeout: 2m
+  parameters:
+    - {variable: lbMode, type: string, defaultValue: cilium, options: [cilium, metallb], label: "LoadBalancer mode"}
+  config:
+    manifests: |
+      {{- if eq .Values.lbMode "metallb" }}
+      apiVersion: metallb.io/v1beta1
+      kind: IPAddressPool
+      metadata:
+        name: nico-internal
+        namespace: {{ .Values.metallbNamespace }}
+      spec:
+        autoAssign: false
+        addresses: [{{ .Values.lbInternalRange | quote }}]
+      ---
+      apiVersion: metallb.io/v1beta1
+      kind: IPAddressPool
+      metadata:
+        name: nico-external
+        namespace: {{ .Values.metallbNamespace }}
+      spec:
+        autoAssign: false
+        addresses: [{{ .Values.lbExternalRange | quote }}]
+      ---
+      apiVersion: metallb.io/v1beta1
+      kind: L2Advertisement
+      metadata:
+        name: nico-l2
+        namespace: {{ .Values.metallbNamespace }}
+      spec:
+        ipAddressPools: [nico-internal, nico-external]
+      {{- else }}
+      apiVersion: cilium.io/v2alpha1
+      kind: CiliumL2AnnouncementPolicy
+      metadata:
+        name: nico-l2-policy
+      spec:
+        interfaces:
+          - {{ .Values.l2Interface | quote }}
+        loadBalancerIPs: true
+        serviceSelector:
+          matchExpressions:
+            - key: io.kubernetes.service.namespace
+              operator: In
+              values: [nico-system]
+        nodeSelector:
+          matchLabels:
+            kubernetes.io/hostname: {{ .Values.edgeNode | quote }}
+      {{- end }}
+---
+apiVersion: management.loft.sh/v1
+kind: App
+metadata:
+  name: nico-step-03-certs
+  labels: {nico.vcluster.com/stack: "true"}
+spec:
+  displayName: "[NiCo 03] CRDs, Vault TLS and the REST site CA"
+  description: Monitoring CRDs the charts render ServiceMonitors against (only the missing ones), the site-root and Vault certificates from the prereqs chart before Vault starts, and the CA the nico-rest cert-manager signs with (ca-signing-secret in nico-rest and cert-manager, ClusterIssuer nico-rest-ca-issuer). Reuses an existing CA.
+  defaultNamespace: vault
+  wait: true
+  timeout: 10m
+  config:
+    manifests: |
+      {{- $n := .Release.Name }}
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata: {name: {{ $n }}, namespace: {{ .Release.Namespace }}}
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata: {name: nico-stack-{{ $n }}}
+      subjects: [{kind: ServiceAccount, name: {{ $n }}, namespace: {{ .Release.Namespace }}}]
+      roleRef: {kind: ClusterRole, name: cluster-admin, apiGroup: rbac.authorization.k8s.io}
+      ---
+      apiVersion: cert-manager.io/v1
+      kind: ClusterIssuer
+      metadata:
+        name: nico-rest-ca-issuer
+      spec:
+        ca:
+          secretName: ca-signing-secret
+      ---
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: {{ $n }}-cleanup
+        namespace: {{ .Release.Namespace }}
+        annotations:
+          "helm.sh/hook": pre-delete
+          "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+      spec:
+        backoffLimit: 0
+        activeDeadlineSeconds: 120
+        template:
+          spec:
+            serviceAccountName: {{ $n }}
+            restartPolicy: Never
+            containers:
+              - name: run
+                image: {{ .Values.hookImage | quote }}
+                env:
+                  - {name: CERT_MANAGER_NS, value: {{ .Values.certManagerNamespace | quote }}}
+                command: [bash, -euo, pipefail, -c]
+                args:
+                  - |
+                    kubectl delete secret ca-signing-secret site-root -n "${CERT_MANAGER_NS}" --ignore-not-found
+                    kubectl delete certificate site-root -n "${CERT_MANAGER_NS}" --ignore-not-found
+                    # pre-install hook resources of the prereqs chart; helm never tracks them
+                    kubectl delete clusterissuer site-issuer selfsigned-bootstrap vault-nico-issuer --ignore-not-found
+      ---
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: {{ $n }}-run
+        namespace: {{ .Release.Namespace }}
+        annotations:
+          "helm.sh/hook": post-install,post-upgrade
+          "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+      spec:
+        backoffLimit: 0
+        activeDeadlineSeconds: 540
+        template:
+          spec:
+            serviceAccountName: {{ $n }}
+            restartPolicy: Never
+            containers:
+              - name: run
+                image: {{ .Values.hookImage | quote }}
+                env:
+                  - {name: CHART, value: {{ printf "%s/nico-prereqs" .Values.chartRegistry | quote }}}
+                  - {name: CHART_VERSION, value: {{ .Values.prereqsChartVersion | quote }}}
+                  - {name: NICO_VERSION, value: {{ .Values.nicoVersion | quote }}}
+                  - {name: CERT_MANAGER_NS, value: {{ .Values.certManagerNamespace | quote }}}
+                command: [bash, -euo, pipefail, -c]
+                args:
+                  - |
+                    if ! kubectl get secret ca-signing-secret -n "${CERT_MANAGER_NS}" >/dev/null 2>&1; then
+                      printf '[req]\ndistinguished_name = dn\nx509_extensions = v3_ca\nprompt = no\n[dn]\nC = US\nO = NVIDIA\nCN = NICo Local Dev CA\n[v3_ca]\nbasicConstraints = critical,CA:TRUE\nkeyUsage = critical,keyCertSign,cRLSign,digitalSignature\nsubjectKeyIdentifier = hash\nauthorityKeyIdentifier = keyid:always,issuer:always\n' > /tmp/ca.cnf
+                      openssl req -x509 -sha256 -nodes -newkey rsa:4096 -keyout /tmp/ca.key -out /tmp/ca.crt -days 3650 -config /tmp/ca.cnf -extensions v3_ca 2>/dev/null
+                      for ns in nico-rest "${CERT_MANAGER_NS}"; do
+                        kubectl create secret tls ca-signing-secret --cert=/tmp/ca.crt --key=/tmp/ca.key -n "${ns}" --dry-run=client -o yaml | kubectl apply -f -
+                      done
+                      echo "site CA created"
+                    fi
+                    raw="https://raw.githubusercontent.com/NVIDIA/infra-controller/${NICO_VERSION}/helm-prereqs/operators/crds"
+                    for crd in podmonitors prometheusrules scrapeconfigs servicemonitors; do
+                      name="${crd}.monitoring.coreos.com"
+                      kubectl get crd "${name}" >/dev/null 2>&1 && { echo "crd ${name} present"; continue; }
+                      curl -fsSL "${raw}/monitoring.coreos.com_${crd}.yaml" | kubectl apply --server-side --field-manager=helmfile --force-conflicts -f -
+                    done
+                    # --field-manager=helm lets the prereqs chart adopt these objects later.
+                    helm template nico-prereqs "${CHART}" --version "${CHART_VERSION}" --namespace nico-system \
+                      --set imagePullSecrets.ngcNicoPull= \
+                      --show-only templates/site-root-certificate.yaml --show-only templates/vault-tls-certs.yaml \
+                      | kubectl apply --server-side --field-manager=helm -f -
+                    kubectl wait --for=condition=Ready certificate/site-root -n "${CERT_MANAGER_NS}" --timeout=180s
+                    kubectl wait --for=condition=Ready certificate/nicoca-vault-client certificate/vault-raft-tls -n vault --timeout=180s
+                    echo "vault TLS ready"
+---
+apiVersion: management.loft.sh/v1
+kind: App
+metadata:
+  name: nico-step-04-vault
+  labels: {nico.vcluster.com/stack: "true"}
+spec:
+  displayName: "[NiCo 04] HashiCorp Vault (HA raft, TLS)"
+  description: Pods stay NotReady until step 05 unseals them, so this step does not wait. Raft is configured for three peers.
+  defaultNamespace: vault
+  wait: false
+  timeout: 10m
+  config:
+    chart:
+      name: vault
+      version: "0.25.0"
+      repoURL: https://helm.releases.hashicorp.com
+    values: |
+      # The stack generates the helm release name; NiCo expects vault-0.vault-internal.
+      fullnameOverride: vault
+      global:
+        tlsDisable: false
+      injector:
+        enabled: false
+      csi:
+        enabled: false
+      server:
+        affinity: ""
+        resources:
+          requests: {cpu: 250m, memory: 512Mi}
+          limits: {cpu: 2000m, memory: 2Gi}
+        readinessProbe:
+          enabled: true
+          path: "/v1/sys/health?standbyok=true"
+        livenessProbe:
+          enabled: true
+          path: "/v1/sys/health?sealedcode=204&uninitcode=204&standbyok=true"
+          initialDelaySeconds: 60
+        dataStorage:
+          enabled: true
+          storageClass: {{ .Values.storageClass | quote }}
+        auditStorage:
+          enabled: true
+          storageClass: {{ .Values.storageClass | quote }}
+        persistentVolumeClaimRetentionPolicy:
+          whenDeleted: Retain
+          whenScaled: Retain
+        extraEnvironmentVars:
+          VAULT_CACERT: /vault/userconfig/nicoca-vault/ca.crt
+        volumes:
+          - name: nicoca-vault
+            secret: {secretName: nicoca-vault-client}
+          - name: vault-raft-tls
+            secret: {secretName: vault-raft-tls}
+        volumeMounts:
+          - {mountPath: /vault/userconfig/nicoca-vault, name: nicoca-vault}
+          - {mountPath: /vault/userconfig/vault-raft-tls, name: vault-raft-tls}
+        shareProcessNamespace: true
+        extraContainers:
+          - name: vault-cert-reload
+            image: alpine:3.8
+            imagePullPolicy: IfNotPresent
+            command:
+              - /bin/sh
+              - -c
+              - |
+                last=0
+                while true; do
+                  cur=$(date +'%s' -r /vault/userconfig/nicoca-vault/ca.crt)
+                  if [ "$cur" -gt "$last" ] && [ -n "$(pidof vault)" ]; then kill -s HUP $(pidof vault); last=$cur; fi
+                  sleep 300
+                done
+            securityContext:
+              capabilities: {add: [SYS_PTRACE]}
+            volumeMounts:
+              - {name: nicoca-vault, mountPath: /vault/userconfig/nicoca-vault}
+        service:
+          publishNotReadyAddresses: false
+        ha:
+          enabled: true
+          replicas: {{ .Values.vaultReplicas }}
+          raft:
+            enabled: true
+            setNodeId: true
+            config: |
+              ui = false
+              listener "tcp" {
+                address         = "[::]:8200"
+                cluster_address = "[::]:8201"
+                tls_cert_file      = "/vault/userconfig/nicoca-vault/tls.crt"
+                tls_key_file       = "/vault/userconfig/nicoca-vault/tls.key"
+                tls_client_ca_file = "/vault/userconfig/nicoca-vault/ca.crt"
+                telemetry { unauthenticated_metrics_access = true }
+              }
+              storage "raft" {
+                path = "/vault/data"
+                retry_join {
+                  leader_tls_servername    = "vault-0.vault-internal"
+                  leader_api_addr          = "https://vault-0.vault-internal:8200"
+                  leader_ca_cert_file      = "/vault/userconfig/vault-raft-tls/ca.crt"
+                  leader_client_cert_file  = "/vault/userconfig/vault-raft-tls/tls.crt"
+                  leader_client_key_file   = "/vault/userconfig/vault-raft-tls/tls.key"
+                }
+                retry_join {
+                  leader_tls_servername    = "vault-1.vault-internal"
+                  leader_api_addr          = "https://vault-1.vault-internal:8200"
+                  leader_ca_cert_file      = "/vault/userconfig/vault-raft-tls/ca.crt"
+                  leader_client_cert_file  = "/vault/userconfig/vault-raft-tls/tls.crt"
+                  leader_client_key_file   = "/vault/userconfig/vault-raft-tls/tls.key"
+                }
+                retry_join {
+                  leader_tls_servername    = "vault-2.vault-internal"
+                  leader_api_addr          = "https://vault-2.vault-internal:8200"
+                  leader_ca_cert_file      = "/vault/userconfig/vault-raft-tls/ca.crt"
+                  leader_client_cert_file  = "/vault/userconfig/vault-raft-tls/tls.crt"
+                  leader_client_key_file   = "/vault/userconfig/vault-raft-tls/tls.key"
+                }
+                autopilot {
+                  cleanup_dead_servers           = "true"
+                  last_contact_threshold         = "200ms"
+                  last_contact_failure_threshold = "10m"
+                  max_trailing_logs              = 250000
+                  min_quorum                     = {{ .Values.vaultReplicas }}
+                  server_stabilization_time      = "10s"
+                }
+              }
+              telemetry {
+                prometheus_retention_time = "30s"
+                disable_hostname          = true
+              }
+              service_registration "kubernetes" {}
+---
+apiVersion: management.loft.sh/v1
+kind: App
+metadata:
+  name: nico-step-05-vault-init
+  labels: {nico.vcluster.com/stack: "true"}
+spec:
+  displayName: "[NiCo 05] Vault init, unseal, ssh-host-key"
+  description: Initialises and unseals every replica and stores keys and root token as Secrets in vault. Nothing is pre-created in nico-system, since the prereqs chart owns that namespace under a release name the stack generates. On stack deletion removes the Vault PVCs and the nico-system/forge-system namespaces the charts leave behind.
+  defaultNamespace: vault
+  wait: true
+  timeout: 15m
+  config:
+    manifests: |
+      {{- $n := .Release.Name }}
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata: {name: {{ $n }}, namespace: {{ .Release.Namespace }}}
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata: {name: nico-stack-{{ $n }}}
+      subjects: [{kind: ServiceAccount, name: {{ $n }}, namespace: {{ .Release.Namespace }}}]
+      roleRef: {kind: ClusterRole, name: cluster-admin, apiGroup: rbac.authorization.k8s.io}
+      ---
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: {{ $n }}-run
+        namespace: {{ .Release.Namespace }}
+        annotations:
+          "helm.sh/hook": post-install,post-upgrade
+          "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+      spec:
+        backoffLimit: 0
+        activeDeadlineSeconds: 840
+        template:
+          spec:
+            serviceAccountName: {{ $n }}
+            restartPolicy: Never
+            containers:
+              - name: run
+                image: {{ .Values.hookImage | quote }}
+                env:
+                  - {name: VAULT_NS, value: vault}
+                  - {name: VAULT_REPLICAS, value: {{ .Values.vaultReplicas | quote }}}
+                command: [bash, -euo, pipefail, -c]
+                args:
+                  - |
+                    vx() { kubectl exec -n "${VAULT_NS}" "$1" -c vault -- "${@:2}"; }
+                    status() { # parseable status, the listener answers before it serves one
+                      local out i
+                      for i in $(seq 1 36); do
+                        out="$(vx "$1" vault status -tls-skip-verify -format=json 2>/dev/null || true)"
+                        jq -e '.initialized|type=="boolean"' <<<"${out}" >/dev/null 2>&1 && { printf '%s' "${out}"; return 0; }
+                        sleep 5
+                      done
+                      echo "no vault status from $1" >&2; return 1
+                    }
+                    for i in $(seq 0 $((VAULT_REPLICAS - 1))); do
+                      until kubectl get pod "vault-${i}" -n "${VAULT_NS}" >/dev/null 2>&1; do sleep 5; done
+                      kubectl wait "pod/vault-${i}" -n "${VAULT_NS}" --for=condition=Initialized --timeout=300s
+                    done
+                    if [[ "$(status vault-0 | jq -r .initialized)" == "false" ]]; then
+                      vx vault-0 vault operator init -tls-skip-verify -key-shares=5 -key-threshold=3 -format=json > /tmp/keys.json
+                      kubectl create secret generic vault-cluster-keys -n "${VAULT_NS}" --from-file=cluster-keys.json=/tmp/keys.json
+                      echo "vault initialised"
+                    fi
+                    kubectl -n "${VAULT_NS}" get secret vault-cluster-keys -o jsonpath='{.data.cluster-keys\.json}' | base64 -d > /tmp/keys.json \
+                      || { echo "vault is initialised but vault-cluster-keys is missing: delete the vault PVCs and rerun" >&2; exit 1; }
+                    mapfile -t UNSEAL < <(jq -r '.unseal_keys_b64[]' /tmp/keys.json)
+                    ROOT="$(jq -r .root_token /tmp/keys.json)"
+                    unseal() {
+                      local round key
+                      [[ "$(status "$1" | jq -r .sealed)" == "false" ]] && { echo "$1 unsealed"; return 0; }
+                      for round in 1 2 3; do
+                        for key in "${UNSEAL[@]:0:3}"; do vx "$1" vault operator unseal -tls-skip-verify "${key}" >/dev/null || true; sleep 5; done
+                        [[ "$(status "$1" | jq -r .sealed)" == "false" ]] && { echo "$1 unsealed"; return 0; }
+                      done
+                      echo "$1 still sealed" >&2; return 1
+                    }
+                    unseal vault-0
+                    for i in $(seq 1 30); do [[ -n "$(status vault-0 | jq -r '.leader_address // empty')" ]] && break; sleep 5; done
+                    for i in $(seq 1 $((VAULT_REPLICAS - 1))); do unseal "vault-${i}"; done
+                    kubectl create secret generic vaultunsealkeys -n "${VAULT_NS}" \
+                      --from-literal=0="${UNSEAL[0]}" --from-literal=1="${UNSEAL[1]}" --from-literal=2="${UNSEAL[2]}" \
+                      --from-literal=3="${UNSEAL[3]}" --from-literal=4="${UNSEAL[4]}" --dry-run=client -o yaml | kubectl apply -f -
+                    kubectl create secret generic vaultroottoken -n "${VAULT_NS}" --from-literal=token="${ROOT}" --dry-run=client -o yaml | kubectl apply -f -
+                    echo "vault ready, root token in ${VAULT_NS}/vaultroottoken"
+      ---
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: {{ $n }}-cleanup
+        namespace: {{ .Release.Namespace }}
+        annotations:
+          "helm.sh/hook": pre-delete
+          "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+      spec:
+        backoffLimit: 0
+        activeDeadlineSeconds: 900
+        template:
+          spec:
+            serviceAccountName: {{ $n }}
+            restartPolicy: Never
+            containers:
+              - name: run
+                image: {{ .Values.hookImage | quote }}
+                command: [bash, -euo, pipefail, -c]
+                args:
+                  - |
+                    # Charts keep these (resource-policy: keep); a re-install needs them gone. Waits, so the
+                    # ExternalSecrets inside are removed while the ESO webhook (deleted in a later wave) still answers.
+                    kubectl delete clusterexternalsecrets.external-secrets.io --all --ignore-not-found --timeout=120s || true
+                    kubectl delete namespace nico-system --ignore-not-found --timeout=780s
+                    kubectl delete pvc -n vault -l app.kubernetes.io/name=vault --ignore-not-found --wait=false
+                    echo "nico-system deleted, vault PVCs scheduled for deletion"
+---
+apiVersion: management.loft.sh/v1
+kind: App
+metadata:
+  name: nico-step-06-external-secrets
+  labels: {nico.vcluster.com/stack: "true"}
+spec:
+  displayName: "[NiCo 06] External Secrets Operator"
+  defaultNamespace: external-secrets
+  wait: true
+  timeout: 10m
+  config:
+    chart:
+      name: external-secrets
+      version: "0.14.3"
+      repoURL: https://charts.external-secrets.io
+    values: |
+      installCRDs: true
+      webhook:
+        port: 9443
+      certController:
+        requeueInterval: "5m"
+---
+apiVersion: management.loft.sh/v1
+kind: App
+metadata:
+  name: nico-step-07-prereqs
+  labels: {nico.vcluster.com/stack: "true"}
+spec:
+  displayName: "[NiCo 07] nico-prereqs (Postgres cluster, Vault PKI, ESO stores)"
+  description: The upstream helm-prereqs chart. vaultToken comes from the vault-init task output. The release lives in default because the chart owns nico-system itself and the Platform pre-creates the release namespace.
+  defaultNamespace: default
+  wait: true
+  timeout: 15m
+  config:
+    chart:
+      name: nico-prereqs
+      version: "0.1.0"
+      repoURL: oci://registry.example.com/nico
+    values: |
+      siteName: {{ .Values.siteName | quote }}
+      namespace: nico-system
+      certManagerNamespace: {{ .Values.certManagerNamespace | quote }}
+      vaultNamespace: vault
+      esoNamespace: external-secrets
+      postgresNamespace: postgres
+      vault:
+        address: "https://vault.vault.svc.cluster.local:8200"
+        token: {{ .Values.vaultToken | quote }}
+        tokenSecret:
+          create: true
+      # ssh-console needs an OpenSSH-format key; the chart's genPrivateKey makes PKCS8. Step 08 creates it.
+      sshHostKey:
+        create: false
+      imagePullSecrets:
+        ngcNicoPull: ""
+      rest:
+        enabled: true
+        namespace: nico-rest
+      flow:
+        enabled: false
+      postgresql:
+        enabled: true
+        # 2 is the minimum that satisfies the chart's synchronous_mode_strict.
+        instances: {{ .Values.postgresInstances }}
+        volumeSize: "10Gi"
+        storageClass: {{ .Values.storageClass | quote }}
+        resources:
+          limits: {cpu: "4", memory: "4Gi"}
+          requests: {cpu: "500m", memory: "1Gi"}
+---
+apiVersion: management.loft.sh/v1
+kind: App
+metadata:
+  name: nico-step-08-prereqs-ready
+  labels: {nico.vcluster.com/stack: "true"}
+spec:
+  displayName: "[NiCo 08] Prereqs gates"
+  description: The ssh-host-key in OpenSSH format, the four gates the scripted installer waits on after nico-prereqs, plus the nico-rest DB credentials ESO syncs into nico-rest (read by the rest task as outputs). On stack deletion removes the Postgres cluster PVCs.
+  defaultNamespace: nico-rest
+  wait: true
+  timeout: 20m
+  config:
+    manifests: |
+      {{- $n := .Release.Name }}
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata: {name: {{ $n }}, namespace: {{ .Release.Namespace }}}
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata: {name: nico-stack-{{ $n }}}
+      subjects: [{kind: ServiceAccount, name: {{ $n }}, namespace: {{ .Release.Namespace }}}]
+      roleRef: {kind: ClusterRole, name: cluster-admin, apiGroup: rbac.authorization.k8s.io}
+      ---
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: {{ $n }}-run
+        namespace: {{ .Release.Namespace }}
+        annotations:
+          "helm.sh/hook": post-install,post-upgrade
+          "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+      spec:
+        backoffLimit: 0
+        activeDeadlineSeconds: 1140
+        template:
+          spec:
+            serviceAccountName: {{ $n }}
+            restartPolicy: Never
+            containers:
+              - name: run
+                image: {{ .Values.hookImage | quote }}
+                command: [bash, -euo, pipefail, -c]
+                args:
+                  - |
+                    wait_for() { # seconds interval label cmd...
+                      local t="$1" i="$2" l="$3" d; shift 3; d=$(( $(date +%s) + t ))
+                      until "$@" >/dev/null 2>&1; do (( $(date +%s) < d )) || { echo "timeout: ${l}" >&2; return 1; }; sleep "${i}"; done
+                      echo "ok: ${l}"
+                    }
+                    if ! kubectl get secret ssh-host-key -n nico-system >/dev/null 2>&1; then
+                      ssh-keygen -t ed25519 -N "" -f /tmp/hk -C "" -q
+                      kubectl create secret generic ssh-host-key -n nico-system --from-file=ssh_host_ed25519_key=/tmp/hk --from-file=ssh_host_ed25519_key_pub=/tmp/hk.pub
+                      echo "ssh-host-key created"
+                    fi
+                    kubectl label namespace nico-system nico.nvidia.com/managed=true --overwrite >/dev/null
+                    kubectl annotate externalsecret nico-roots-eso -n nico-system force-sync="$(date +%s)" --overwrite 2>/dev/null || true
+                    wait_for 300 3 "secret nico-system/nico-roots" kubectl get secret nico-roots -n nico-system
+                    pg_running() { [[ "$(kubectl get postgresql nico-pg-cluster -n postgres -o jsonpath='{.status.PostgresClusterStatus}')" == Running ]]; }
+                    wait_for 600 10 "postgresql/nico-pg-cluster Running" pg_running
+                    primary() { kubectl get pods -n postgres -l application=spilo,spilo-role=master -o jsonpath='{.items[0].metadata.name}'; }
+                    trgm() { local p; p="$(primary)"; [[ -n "${p}" ]] && kubectl exec -n postgres "${p}" -- su postgres -c "psql -d nico_rest -c 'CREATE EXTENSION IF NOT EXISTS pg_trgm;'"; }
+                    wait_for 180 5 "pg_trgm on nico_rest" trgm
+                    wait_for 300 5 "secret nico-system/nico-system.nico.nico-pg-cluster.credentials" kubectl get secret nico-system.nico.nico-pg-cluster.credentials -n nico-system
+                    pki_done() { [[ -n "$(kubectl get job vault-pki-config -n nico-system -o jsonpath='{.status.succeeded}')" ]]; }
+                    wait_for 600 10 "job vault-pki-config" pki_done
+                    approle() { local k; k="$(kubectl get secret nico-vault-approle-tokens -n nico-system -o jsonpath='{.data.VAULT_ROLE_ID}{" "}{.data.VAULT_SECRET_ID}')"; [[ "${k}" =~ ^[^\ ]+\ [^\ ]+$ ]]; }
+                    wait_for 180 5 "AppRole ids in nico-vault-approle-tokens" approle
+                    wait_for 300 5 "secret nico-rest/nico-rest-pg-creds" kubectl get secret nico-rest-pg-creds -n nico-rest
+      ---
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: {{ $n }}-cleanup
+        namespace: {{ .Release.Namespace }}
+        annotations:
+          "helm.sh/hook": pre-delete
+          "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+      spec:
+        backoffLimit: 0
+        activeDeadlineSeconds: 300
+        template:
+          spec:
+            serviceAccountName: {{ $n }}
+            restartPolicy: Never
+            containers:
+              - name: run
+                image: {{ .Values.hookImage | quote }}
+                command: [bash, -euo, pipefail, -c]
+                args:
+                  - |
+                    kubectl delete pvc -n postgres -l application=spilo --ignore-not-found --wait=false
+                    echo "postgres cluster PVCs scheduled for deletion"

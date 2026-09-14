@@ -1,0 +1,61 @@
+# A NiCo site as a StackInstance. Addresses are RFC 5737 documentation ranges: replace every value
+# in the networks and machines blocks. Destination is a connected cluster that also runs the Platform.
+apiVersion: management.loft.sh/v1
+kind: StackInstance
+metadata:
+  name: nico-site
+  namespace: p-default
+spec:
+  displayName: "NiCo site"
+  destination:
+    cluster:
+      name: loft-cluster
+  templateRef:
+    name: nico-site
+  owner:
+    user: admin
+  prunePolicy: Prune
+  defaults:
+    taskTimeout: 20m
+  parameters:
+    # --- registry and cluster
+    chartRegistry: oci://registry.example.com/nico
+    hookImage: registry.example.com/nico/hook:1.33.4
+    storageClass: standard-retain
+    loftHost: platform.example.com
+    lbMode: cilium                 # cilium | metallb
+    edgeNode: node-1               # cilium: announces the VIPs, runs nico-api/pxe/dhcp
+    l2Interface: eth0              # cilium
+    # --- site identity
+    siteName: lab
+    siteDomain: lab.nico
+    org: ncx
+    # --- networks: HostInband = the L2 segment the machines' NICs are on; OOB = where the BMCs listen
+    hostinbandName: lab-inband
+    hostinbandPrefix: 192.0.2.0/24
+    hostinbandGateway: 192.0.2.1
+    hostinbandReserveFirst: "50"
+    hostinbandReverseZone: 2.0.192.in-addr.arpa
+    oobName: lab-oob
+    oobPrefix: 198.51.100.0/24
+    oobGateway: 198.51.100.1
+    # ten LoadBalancer addresses; Kea and PXE must be routable from the machines
+    vipDhcp: 198.51.100.236
+    vipDns0: 198.51.100.237
+    vipDns1: 198.51.100.238
+    vipPxe: 198.51.100.239
+    vipNtp0: 198.51.100.240
+    vipNtp1: 198.51.100.241
+    vipNtp2: 198.51.100.242
+    vipSshConsole: 198.51.100.243
+    vipUnbound: 198.51.100.244
+    vipApi: 198.51.100.245
+    macClassTest: "substring(pkt4.mac,3,1) == 0xbb"   # Kea answers only machines whose MAC byte 3 is 0xbb
+    # --- machines: names, BMC addresses (same order), MAC and serial conventions the BMCs were set up with
+    machineNames: "nico-vm-1 nico-vm-2"
+    bmcIps: "198.51.100.202 198.51.100.203"
+    bmcMacPrefix: "02:00:00:00:0B"
+    dataMacPrefix: "52:54:00:BB:00"
+    serialPrefix: NICO-VM-
+    bmcUsername: admin
+    bmcPassword: password

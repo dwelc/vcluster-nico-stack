@@ -1,0 +1,602 @@
+# NiCo stack, REST steps (12-18). The site CA is created in step 03.
+---
+apiVersion: management.loft.sh/v1
+kind: App
+metadata:
+  name: nico-step-12-rest-bootstrap
+  labels: {nico.vcluster.com/stack: "true"}
+spec:
+  displayName: "[NiCo 12] REST bootstrap: Postgres, Temporal DB creds and mTLS certificates"
+  description: The upstream single-node Postgres for nico-rest workflow state and Temporal, with PGDATA under a subdirectory (block volumes carry lost+found, which initdb refuses).
+  defaultNamespace: postgres
+  wait: true
+  timeout: 10m
+  config:
+    manifests: |
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: admin-creds
+        namespace: postgres
+        labels: {app.kubernetes.io/part-of: postgres}
+      type: Opaque
+      stringData:
+        password: "postgres"
+      ---
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: postgres-init
+        namespace: postgres
+        labels: {app: postgres}
+      data:
+        01-init-databases.sql: |
+          CREATE EXTENSION IF NOT EXISTS pg_trgm;
+          SELECT 'CREATE DATABASE nico WITH ENCODING ''UTF8''' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'nico')\gexec
+          DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='nico') THEN CREATE ROLE nico LOGIN PASSWORD 'nico'; END IF; END $$;
+          GRANT ALL PRIVILEGES ON DATABASE nico TO nico;
+          \c nico
+          GRANT ALL ON SCHEMA public TO nico;
+          CREATE EXTENSION IF NOT EXISTS pg_trgm;
+          \c postgres
+          SELECT 'CREATE DATABASE temporal WITH ENCODING ''UTF8''' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'temporal')\gexec
+          DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='temporal') THEN CREATE ROLE temporal LOGIN PASSWORD 'temporal' CREATEDB; END IF; END $$;
+          GRANT ALL PRIVILEGES ON DATABASE temporal TO temporal;
+          ALTER DATABASE temporal OWNER TO temporal;
+          \c temporal
+          GRANT ALL ON SCHEMA public TO temporal;
+          ALTER SCHEMA public OWNER TO temporal;
+          \c postgres
+          SELECT 'CREATE DATABASE temporal_visibility WITH ENCODING ''UTF8''' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'temporal_visibility')\gexec
+          GRANT ALL PRIVILEGES ON DATABASE temporal_visibility TO temporal;
+          ALTER DATABASE temporal_visibility OWNER TO temporal;
+          \c temporal_visibility
+          GRANT ALL ON SCHEMA public TO temporal;
+          ALTER SCHEMA public OWNER TO temporal;
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: postgres
+        namespace: postgres
+        labels: {app: postgres}
+      spec:
+        type: ClusterIP
+        ports: [{port: 5432, targetPort: 5432, name: postgres}]
+        selector: {app: postgres}
+      ---
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: postgres
+        namespace: postgres
+        labels: {app: postgres}
+      spec:
+        serviceName: postgres
+        replicas: 1
+        selector:
+          matchLabels: {app: postgres}
+        persistentVolumeClaimRetentionPolicy:
+          whenDeleted: Delete
+          whenScaled: Retain
+        template:
+          metadata:
+            labels: {app: postgres}
+          spec:
+            containers:
+              - name: postgres
+                image: postgres:14.4-alpine
+                ports: [{containerPort: 5432, name: postgres}]
+                env:
+                  - {name: POSTGRES_USER, value: postgres}
+                  - name: POSTGRES_PASSWORD
+                    valueFrom: {secretKeyRef: {name: admin-creds, key: password}}
+                  - {name: POSTGRES_DB, value: postgres}
+                  - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+                volumeMounts:
+                  - {name: postgres-data, mountPath: /var/lib/postgresql/data}
+                  - {name: init-scripts, mountPath: /docker-entrypoint-initdb.d}
+                resources:
+                  requests: {memory: "256Mi", cpu: "250m"}
+                  limits: {memory: "512Mi", cpu: "500m"}
+                readinessProbe:
+                  exec: {command: [pg_isready, -U, postgres]}
+                  initialDelaySeconds: 5
+                  periodSeconds: 5
+                livenessProbe:
+                  exec: {command: [pg_isready, -U, postgres]}
+                  initialDelaySeconds: 30
+                  periodSeconds: 10
+            volumes:
+              - name: init-scripts
+                configMap: {name: postgres-init}
+        volumeClaimTemplates:
+          - metadata: {name: postgres-data}
+            spec:
+              accessModes: [ReadWriteOnce]
+              storageClassName: {{ .Values.storageClass | quote }}
+              resources: {requests: {storage: 1Gi}}
+      ---
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: db-creds
+        namespace: temporal
+        labels: {app.kubernetes.io/part-of: temporal}
+      type: Opaque
+      stringData:
+        password: "temporal"
+      {{- $certs := dict "server-interservice-cert" (list "interservice.server.temporal.local" "temporal-frontend" "temporal-frontend.temporal" "temporal-frontend.temporal.svc" "temporal-frontend.temporal.svc.cluster.local" "temporal-history" "temporal-history.temporal" "temporal-history.temporal.svc" "temporal-history.temporal.svc.cluster.local" "temporal-matching" "temporal-matching.temporal" "temporal-matching.temporal.svc" "temporal-matching.temporal.svc.cluster.local" "temporal-worker" "temporal-worker.temporal" "temporal-worker.temporal.svc" "temporal-worker.temporal.svc.cluster.local")
+                     "server-cloud-cert" (list "cloud.server.temporal.local" "cloud.temporal-frontend" "cloud.temporal-frontend.temporal" "cloud.temporal-frontend.temporal.svc.cluster.local")
+                     "server-site-cert" (list "site.server.temporal.local" "site.temporal-frontend" "site.temporal-frontend.temporal" "site.temporal-frontend.temporal.svc.cluster.local") }}
+      {{- range $name, $dns := $certs }}
+      ---
+      apiVersion: cert-manager.io/v1
+      kind: Certificate
+      metadata:
+        name: {{ $name }}
+        namespace: temporal
+      spec:
+        secretName: {{ $name }}s
+        duration: 2160h
+        renewBefore: 360h
+        subject:
+          organizations: [NVIDIA]
+        isCA: false
+        privateKey: {algorithm: RSA, size: 2048}
+        usages: [server auth, client auth]
+        dnsNames:
+        {{- range $dns }}
+          - {{ . }}
+        {{- end }}
+        issuerRef: {name: nico-rest-ca-issuer, kind: ClusterIssuer, group: cert-manager.io}
+      {{- end }}
+---
+apiVersion: management.loft.sh/v1
+kind: App
+metadata:
+  name: nico-step-14-temporal
+  labels: {nico.vcluster.com/stack: "true"}
+spec:
+  displayName: "[NiCo 14] Temporal"
+  description: The vendored Temporal chart with the upstream kind values, frontend on ClusterIP instead of NodePort.
+  defaultNamespace: temporal
+  wait: true
+  timeout: 15m
+  config:
+    chart:
+      name: temporal
+      version: "0.35.0"
+      repoURL: oci://registry.example.com/nico
+    values: |
+      # The values renderer is slim-sprig, so this stays longhand (no merge/dict).
+      # The stack generates the helm release name; NiCo expects temporal-frontend.temporal.
+      fullnameOverride: temporal
+      serviceAccount:
+        create: false
+      server:
+        enabled: true
+        image: {repository: temporalio/server, tag: 1.26.2, pullPolicy: IfNotPresent}
+        replicaCount: 1
+        additionalEnv:
+          - {name: TEMPORAL_CLI_TLS_SERVER_NAME, value: interservice.server.temporal.local}
+          - {name: TEMPORAL_CLI_TLS_CERT, value: /var/secrets/temporal/certs/server-interservice/tls.crt}
+          - {name: TEMPORAL_CLI_TLS_KEY, value: /var/secrets/temporal/certs/server-interservice/tls.key}
+          - {name: TEMPORAL_CLI_TLS_CA, value: /var/secrets/temporal/certs/server-interservice/ca.crt}
+          - {name: TEMPORAL_CLI_TLS_ENABLE_HOST_VERIFICATION, value: "true"}
+        metrics:
+          annotations: {enabled: true}
+          serviceMonitor: {enabled: false}
+          prometheus: {timerType: histogram}
+        additionalVolumeMounts:
+          - {name: server-interservice-certs, mountPath: "/var/secrets/temporal/certs/server-interservice/", readOnly: true}
+          - {name: server-cloud-certs, mountPath: "/var/secrets/temporal/certs/server-cloud/", readOnly: true}
+          - {name: server-site-certs, mountPath: "/var/secrets/temporal/certs/server-site/", readOnly: true}
+        additionalVolumes:
+          - {name: server-interservice-certs, secret: {secretName: server-interservice-certs}}
+          - {name: server-cloud-certs, secret: {secretName: server-cloud-certs}}
+          - {name: server-site-certs, secret: {secretName: server-site-certs}}
+        securityContext: {fsGroup: 1000, runAsUser: 1000}
+        config:
+          logLevel: "debug,info"
+          numHistoryShards: 512
+          persistence:
+            defaultStore: default
+            additionalStores: {}
+            default:
+              driver: "sql"
+              sql:
+                driver: "postgres12"
+                host: "postgres.postgres.svc.cluster.local"
+                port: 5432
+                database: "temporal"
+                user: "temporal"
+                existingSecret: "db-creds"
+                maxConns: 20
+                maxConnLifetime: "1h"
+            visibility:
+              driver: "sql"
+              sql:
+                driver: "postgres12"
+                host: "postgres.postgres.svc.cluster.local"
+                port: 5432
+                database: "temporal_visibility"
+                user: "temporal"
+                existingSecret: "db-creds"
+                maxConns: 20
+                maxConnLifetime: "1h"
+          global:
+            tls:
+              refreshInterval: 15m
+              internode:
+                server:
+                  certFile: /var/secrets/temporal/certs/server-interservice/tls.crt
+                  keyFile: /var/secrets/temporal/certs/server-interservice/tls.key
+                  requireClientAuth: true
+                  clientCaFiles: [/var/secrets/temporal/certs/server-interservice/ca.crt]
+                client:
+                  serverName: interservice.server.temporal.local
+                  rootCaFiles: [/var/secrets/temporal/certs/server-interservice/ca.crt]
+              frontend:
+                server:
+                  certFile: /var/secrets/temporal/certs/server-interservice/tls.crt
+                  keyFile: /var/secrets/temporal/certs/server-interservice/tls.key
+                  requireClientAuth: true
+                  clientCaFiles: [/var/secrets/temporal/certs/server-interservice/ca.crt]
+                client:
+                  serverName: interservice.server.temporal.local
+                  rootCaFiles: [/var/secrets/temporal/certs/server-interservice/ca.crt]
+                hostOverrides:
+                  cloud.server.temporal.local:
+                    certFile: /var/secrets/temporal/certs/server-cloud/tls.crt
+                    keyFile: /var/secrets/temporal/certs/server-cloud/tls.key
+                    requireClientAuth: true
+                    clientCaFiles: [/var/secrets/temporal/certs/server-interservice/ca.crt]
+                  site.server.temporal.local:
+                    certFile: /var/secrets/temporal/certs/server-site/tls.crt
+                    keyFile: /var/secrets/temporal/certs/server-site/tls.key
+                    requireClientAuth: true
+                    clientCaFiles: [/var/secrets/temporal/certs/server-interservice/ca.crt]
+        frontend:
+          replicaCount: 1
+          service: {type: ClusterIP, port: 7233}
+          metrics: {annotations: {enabled: true}}
+        history:
+          replicaCount: 1
+          service: {port: 7234}
+          metrics: {annotations: {enabled: true}}
+        matching:
+          replicaCount: 1
+          service: {port: 7235}
+          metrics: {annotations: {enabled: false}}
+        worker:
+          replicaCount: 1
+          service: {port: 7239}
+          metrics: {annotations: {enabled: true}}
+      admintools:
+        enabled: true
+        image: {repository: temporalio/admin-tools, tag: 1.26.2, pullPolicy: IfNotPresent}
+        additionalEnv:
+          - {name: TEMPORAL_CLI_TLS_SERVER_NAME, value: interservice.server.temporal.local}
+          - {name: TEMPORAL_CLI_TLS_CERT, value: /var/secrets/temporal/certs/server-interservice/tls.crt}
+          - {name: TEMPORAL_CLI_TLS_KEY, value: /var/secrets/temporal/certs/server-interservice/tls.key}
+          - {name: TEMPORAL_CLI_TLS_CA, value: /var/secrets/temporal/certs/server-interservice/ca.crt}
+          - {name: TEMPORAL_CLI_TLS_DISABLE_HOST_VERIFICATION, value: "false"}
+        service: {type: ClusterIP, port: 22}
+        volumeMounts:
+          - {name: server-interservice-certs, mountPath: "/var/secrets/temporal/certs/server-interservice/", readOnly: true}
+        volumes:
+          - {name: server-interservice-certs, secret: {secretName: server-interservice-certs}}
+      web:
+        enabled: true
+        config:
+          auth: {enabled: false}
+          routing: {default_to_namespace: null, issue_report_link: https://github.com/temporalio/web/issues/new/choose}
+        replicaCount: 1
+        additionalEnv:
+          - {name: TEMPORAL_TLS_SERVER_NAME, value: interservice.server.temporal.local}
+          - {name: TEMPORAL_TLS_ENABLE_HOST_VERIFICATION, value: "true"}
+          - {name: TEMPORAL_TLS_CERT, value: /var/secrets/temporal/certs/server-interservice/tls.crt}
+          - {name: TEMPORAL_TLS_KEY, value: /var/secrets/temporal/certs/server-interservice/tls.key}
+          - {name: TEMPORAL_TLS_CA, value: /var/secrets/temporal/certs/server-interservice/ca.crt}
+        image: {repository: temporalio/ui, tag: 2.26.2, pullPolicy: IfNotPresent}
+        service: {type: ClusterIP, port: 8080}
+        ingress: {enabled: false}
+        volumeMounts:
+          - {name: server-interservice-certs, mountPath: "/var/secrets/temporal/certs/server-interservice/", readOnly: true}
+        volumes:
+          - {name: server-interservice-certs, secret: {secretName: server-interservice-certs}}
+      schema:
+        setup: {enabled: true, backoffLimit: 100}
+        update: {enabled: true, backoffLimit: 100}
+      elasticsearch: {enabled: false}
+      prometheus: {enabled: false}
+      grafana: {enabled: false}
+      cassandra: {enabled: false}
+      mysql: {enabled: false}
+---
+apiVersion: management.loft.sh/v1
+kind: App
+metadata:
+  name: nico-step-15-temporal-namespaces
+  labels: {nico.vcluster.com/stack: "true"}
+spec:
+  displayName: "[NiCo 15] Temporal namespaces (cloud, site, flow)"
+  description: flow is created even without Flow, the workers panic without it.
+  defaultNamespace: temporal
+  wait: true
+  timeout: 10m
+  config:
+    manifests: |
+      {{- $n := .Release.Name }}
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata: {name: {{ $n }}, namespace: {{ .Release.Namespace }}}
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata: {name: nico-stack-{{ $n }}}
+      subjects: [{kind: ServiceAccount, name: {{ $n }}, namespace: {{ .Release.Namespace }}}]
+      roleRef: {kind: ClusterRole, name: cluster-admin, apiGroup: rbac.authorization.k8s.io}
+      ---
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: {{ $n }}-run
+        namespace: {{ .Release.Namespace }}
+        annotations:
+          "helm.sh/hook": post-install,post-upgrade
+          "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+      spec:
+        backoffLimit: 0
+        activeDeadlineSeconds: 540
+        template:
+          spec:
+            serviceAccountName: {{ $n }}
+            restartPolicy: Never
+            containers:
+              - name: run
+                image: {{ .Values.hookImage | quote }}
+                env:
+                  - {name: NAMESPACES, value: {{ .Values.temporalNamespaces | default "cloud site flow" | quote }}}
+                command: [bash, -euo, pipefail, -c]
+                args:
+                  - |
+                    T="temporal operator namespace"
+                    A="--address temporal-frontend.temporal:7233 --tls-cert-path /var/secrets/temporal/certs/server-interservice/tls.crt --tls-key-path /var/secrets/temporal/certs/server-interservice/tls.key --tls-ca-path /var/secrets/temporal/certs/server-interservice/ca.crt --tls-server-name interservice.server.temporal.local"
+                    tx() { kubectl exec -n temporal deploy/temporal-admintools -- sh -c "$1"; }
+                    kubectl rollout status deploy/temporal-frontend deploy/temporal-admintools -n temporal --timeout=300s
+                    for i in $(seq 1 24); do tx "${T} list ${A}" >/dev/null 2>&1 && break; sleep 5; done
+                    for ns in ${NAMESPACES}; do
+                      if tx "${T} describe -n ${ns} ${A}" >/dev/null 2>&1; then echo "namespace ${ns} exists"; continue; fi
+                      out="$(tx "${T} create -n ${ns} --retention 72h ${A}" 2>&1)" || grep -qi 'already exists' <<<"${out}" || { echo "${out}" >&2; exit 1; }
+                      echo "namespace ${ns} created"
+                    done
+                    for i in $(seq 1 24); do
+                      list="$(tx "${T} list ${A}" 2>/dev/null)"; missing=0
+                      for ns in ${NAMESPACES}; do grep -Eq "(^|[^[:alnum:]_-])${ns}([^[:alnum:]_-]|$)" <<<"${list}" || missing=1; done
+                      (( missing == 0 )) && { echo "all namespaces registered"; exit 0; }; sleep 5
+                    done
+                    echo "namespaces not listed cluster-wide after 2m" >&2; exit 1
+---
+apiVersion: management.loft.sh/v1
+kind: App
+metadata:
+  name: nico-step-16-rest
+  labels: {nico.vcluster.com/stack: "true"}
+spec:
+  displayName: "[NiCo 16] NiCo REST"
+  description: nico-rest trusting vCluster Platform-issued tokens (RS256, Platform OIDC key). Keycloak disabled. DB credentials come from the prereqs-ready task outputs.
+  defaultNamespace: nico-rest
+  wait: true
+  timeout: 15m
+  config:
+    chart:
+      name: nico-rest
+      version: "0.1.13"
+      repoURL: oci://registry.example.com/nico
+    values: |
+      global:
+        image:
+          repository: {{ .Values.imageRegistry | quote }}
+          tag: {{ .Values.nicoVersion | quote }}
+          pullPolicy: IfNotPresent
+      nico-rest-api:
+        replicaCount: 1
+        nodePort:
+          enabled: true
+          port: 30388
+        config:
+          keycloak:
+            enabled: false
+          issuers:
+            - name: vcluster-platform
+              origin: custom
+              jwks: {{ printf "http://loft.%s.svc.cluster.local:80/oidc/keys" .Values.platformNamespace | quote }}
+              issuer: {{ printf "https://%s/oidc" .Values.loftHost | quote }}
+              audiences:
+                - {{ printf "http://nico-rest-api.nico-rest.svc.cluster.local:%s" .Values.restPort | quote }}
+              claimMappings:
+                - orgAttribute: organization
+                  orgDisplayAttribute: organization
+                  rolesAttribute: roles
+      nico-rest-cert-manager:
+        replicaCount: 1
+      nico-rest-site-manager:
+        replicaCount: 1
+      nico-rest-cloud-worker:
+        replicaCount: 1
+      nico-rest-site-worker:
+        replicaCount: 1
+      nico-rest-common:
+        secrets:
+          dbCreds:
+            username: {{ .Values.pgUser | quote }}
+            password: {{ .Values.pgPassword | quote }}
+      nico-rest-workflow:
+        cloudWorker: {replicaCount: 1}
+        siteWorker: {replicaCount: 1}
+        secrets:
+          dbCreds: "db-creds"
+        config:
+          db:
+            host: "nico-pg-cluster.postgres.svc.cluster.local"
+            name: "nico_rest"
+            user: "nico-rest.nico"
+---
+apiVersion: management.loft.sh/v1
+kind: App
+metadata:
+  name: nico-step-17-site
+  labels: {nico.vcluster.com/stack: "true"}
+spec:
+  displayName: "[NiCo 17] Register the site"
+  description: Registers the site through the REST API with a Platform-minted provider token, stores its id in Secret nico-rest/nico-site (task output siteid) and creates the site Temporal namespace. Adopts an existing site of the same name.
+  defaultNamespace: nico-rest
+  wait: true
+  timeout: 10m
+  config:
+    manifests: |
+      {{- $n := .Release.Name }}
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata: {name: {{ $n }}, namespace: {{ .Release.Namespace }}}
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata: {name: nico-stack-{{ $n }}}
+      subjects: [{kind: ServiceAccount, name: {{ $n }}, namespace: {{ .Release.Namespace }}}]
+      roleRef: {kind: ClusterRole, name: cluster-admin, apiGroup: rbac.authorization.k8s.io}
+      ---
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: nico-site
+        namespace: {{ .Release.Namespace }}
+      type: Opaque
+      ---
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: {{ $n }}-run
+        namespace: {{ .Release.Namespace }}
+        annotations:
+          "helm.sh/hook": post-install,post-upgrade
+          "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+      spec:
+        backoffLimit: 0
+        activeDeadlineSeconds: 540
+        template:
+          spec:
+            serviceAccountName: {{ $n }}
+            restartPolicy: Never
+            containers:
+              - name: run
+                image: {{ .Values.hookImage | quote }}
+                env:
+                  - {name: SITE_NAME, value: {{ .Values.siteName | quote }}}
+                  - {name: ORG, value: {{ .Values.org | quote }}}
+                  - {name: PLATFORM_NS, value: {{ .Values.platformNamespace | quote }}}
+                  - {name: LOFT_HOST, value: {{ .Values.loftHost | quote }}}
+                  - {name: REST_PORT, value: {{ .Values.restPort | quote }}}
+                command: [bash, -euo, pipefail, -c]
+                args:
+                  - |
+                    AUD="http://nico-rest-api.nico-rest.svc.cluster.local:${REST_PORT}"
+                    b64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+                    mint() { # org role: the same JWT the Platform NodeProvider mints (pkg/autoscaling/nico/credentials.go)
+                      local sub="platform:provider:$1" now kid hdr pay sig
+                      kubectl -n "${PLATFORM_NS}" get secret loft-cert -o jsonpath='{.data.tls\.key}' | base64 -d > /tmp/key
+                      kid="$(curl -fsS "http://loft.${PLATFORM_NS}.svc.cluster.local/oidc/keys" | jq -r '.keys[0].kid')"
+                      now=$(date +%s)
+                      hdr="$(jq -nc --arg kid "${kid}" '{alg:"RS256",typ:"JWT",kid:$kid}' | b64)"
+                      pay="$(jq -nc --arg iss "https://${LOFT_HOST}/oidc" --arg sub "${sub}" --arg aud "${AUD}" --arg org "$1" --arg role "$2" \
+                        --argjson iat "${now}" --argjson exp "$((now + 1800))" \
+                        '{iss:$iss,sub:$sub,aud:[$aud],iat:$iat,nbf:$iat,exp:$exp,organization:$org,roles:[$role]}' | b64)"
+                      sig="$(printf '%s.%s' "${hdr}" "${pay}" | openssl dgst -sha256 -sign /tmp/key | b64)"
+                      printf '%s.%s.%s' "${hdr}" "${pay}" "${sig}"
+                    }
+                    TOKEN="$(mint "${ORG}" PROVIDER_ADMIN)"
+                    rest() { curl -sS --fail-with-body -X "$1" -H "Authorization: Bearer ${TOKEN}" -H 'Accept: application/json' -H 'Content-Type: application/json' ${3:+--data "$3"} "${AUD}/v2/org/${ORG}/nico$2"; }
+                    LIST='if type == "array" then . else (.items // .data // .sites // .results // []) end'
+                    # Materialises the org's InfrastructureProvider (what the Platform driver calls first);
+                    # /service-account/current only does that for Keycloak service accounts.
+                    for i in $(seq 1 30); do rest GET /infrastructure-provider/current >/dev/null 2>&1 && break; sleep 10; done
+                    rest GET /infrastructure-provider/current | jq -r '"infrastructure provider \(.id) for org \(.org // "?")"' 
+                    id="$(rest GET /site | jq -r --arg n "${SITE_NAME}" "${LIST} | map(select(.name==\$n)) | .[0].id // empty")"
+                    if [[ -z "${id}" ]]; then
+                      id="$(rest POST /site "$(jq -nc --arg n "${SITE_NAME}" '{name:$n}')" | jq -r .id)"
+                      echo "created site ${SITE_NAME}"
+                    else
+                      echo "adopted site ${SITE_NAME}"
+                    fi
+                    [[ "${id}" =~ ^[0-9a-fA-F-]{36}$ ]] || { echo "bad site id: ${id}" >&2; exit 1; }
+                    kubectl patch secret nico-site -n nico-rest -p "$(jq -nc --arg id "${id}" '{stringData:{id:$id}}')"
+                    echo "site ${SITE_NAME} = ${id}"
+                    # The site-agent panics without its per-site Temporal namespace.
+                    T="temporal operator namespace"
+                    A="--address temporal-frontend.temporal:7233 --tls-cert-path /var/secrets/temporal/certs/server-interservice/tls.crt --tls-key-path /var/secrets/temporal/certs/server-interservice/tls.key --tls-ca-path /var/secrets/temporal/certs/server-interservice/ca.crt --tls-server-name interservice.server.temporal.local"
+                    tx() { kubectl exec -n temporal deploy/temporal-admintools -- sh -c "$1"; }
+                    if ! tx "${T} describe -n ${id} ${A}" >/dev/null 2>&1; then
+                      out="$(tx "${T} create -n ${id} --retention 72h ${A}" 2>&1)" || grep -qi 'already exists' <<<"${out}" || { echo "${out}" >&2; exit 1; }
+                    fi
+                    # create returns before the namespace is registered cluster-wide.
+                    for i in $(seq 1 60); do tx "${T} describe -n ${id} ${A}" 2>/dev/null | grep -q 'State *Registered' && { echo "temporal namespace ${id} registered"; exit 0; }; sleep 5; done
+                    echo "temporal namespace ${id} not registered after 5m" >&2; exit 1
+---
+apiVersion: management.loft.sh/v1
+kind: App
+metadata:
+  name: nico-step-18-site-agent
+  labels: {nico.vcluster.com/stack: "true"}
+spec:
+  displayName: "[NiCo 18] REST site-agent"
+  description: The site-agent chart bound to the site id. Step 17 created the site Temporal namespace the agent needs.
+  defaultNamespace: nico-rest
+  wait: true
+  timeout: 15m
+  config:
+    chart:
+      name: nico-rest-site-agent
+      version: "0.1.9"
+      repoURL: oci://registry.example.com/nico
+    values: |
+      global:
+        image:
+          repository: {{ .Values.imageRegistry | quote }}
+          tag: {{ .Values.nicoVersion | quote }}
+          pullPolicy: IfNotPresent
+        certificate:
+          issuerRef: {kind: ClusterIssuer, name: vault-nico-issuer, group: cert-manager.io}
+      replicaCount: {{ .Values.siteAgentReplicas | default 1 }}
+      bootstrap:
+        enabled: true
+        siteManager:
+          address: "nico-rest-site-manager.nico-rest:8100"
+      certificate:
+        uris: ["spiffe://nico.local/nico-system/sa/elektra-site-agent"]
+      envConfig:
+        ESA_PORT: "8080"
+        METRICS_PORT: "2112"
+        DEV_MODE: "true"
+        ENABLE_DEBUG: "true"
+        ENABLE_TLS: "true"
+        CORE_GRPC_ADDRESS: "nico-api.nico-system.svc.cluster.local:1079"
+        CORE_GRPC_SEC_OPT: "2"
+        CARBIDE_ADDRESS: "nico-api.nico-system.svc.cluster.local:1079"
+        CARBIDE_SEC_OPT: "2"
+        DB_ADDR: "nico-pg-cluster.postgres.svc.cluster.local"
+        DB_DATABASE: "nico_rest"
+        DB_PORT: "5432"
+        TEMPORAL_HOST: "temporal-frontend.temporal"
+        TEMPORAL_PORT: "7233"
+        TEMPORAL_SERVER: "interservice.server.temporal.local"
+        TEMPORAL_PUBLISH_NAMESPACE: "site"
+        TEMPORAL_PUBLISH_QUEUE: "site"
+        TEMPORAL_INVENTORY_SCHEDULE: "@every 3m"
+        TEMPORAL_CERT_PATH: "/etc/temporal-certs"
+        TEMPORAL_CERT: "temporal-client-site-agent-certs"
+        CLUSTER_ID: {{ .Values.siteId | quote }}
+        TEMPORAL_SUBSCRIBE_NAMESPACE: {{ .Values.siteId | quote }}
+        TEMPORAL_SUBSCRIBE_QUEUE: "site"
+        FLOW_GRPC_ENABLED: "false"

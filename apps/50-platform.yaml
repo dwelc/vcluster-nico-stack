@@ -1,0 +1,187 @@
+# NiCo stack, Platform objects (30). Runs on the Platform's own host cluster, where the
+# management API is served, so kubectl can create NodeProvider/Tenant/NetworkEnvironment/OSImage.
+---
+apiVersion: management.loft.sh/v1
+kind: App
+metadata:
+  name: nico-step-30-platform-objects
+  labels: {nico.vcluster.com/stack: "true"}
+spec:
+  displayName: "[NiCo 30] vCluster Platform NodeProvider, OSImage, Tenant, NetworkEnvironment"
+  description: Wires a NiCo site into the Platform. Deleting the stack removes them in reverse order.
+  defaultNamespace: default
+  wait: true
+  timeout: 15m
+  config:
+    manifests: |
+      {{- $n := .Release.Name }}
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata: {name: {{ $n }}, namespace: {{ .Release.Namespace }}}
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata: {name: nico-stack-{{ $n }}}
+      subjects: [{kind: ServiceAccount, name: {{ $n }}, namespace: {{ .Release.Namespace }}}]
+      roleRef: {kind: ClusterRole, name: cluster-admin, apiGroup: rbac.authorization.k8s.io}
+      ---
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ $n }}-objects
+        namespace: {{ .Release.Namespace }}
+      data:
+        objects.yaml: |
+          apiVersion: management.loft.sh/v1
+          kind: NodeProvider
+          metadata:
+            name: {{ .Values.providerName }}
+          spec:
+            displayName: {{ .Values.providerName | quote }}
+            nico:
+              endpoint: {{ printf "http://nico-rest-api.nico-rest.svc.cluster.local:%s" .Values.restPort | quote }}
+              org: {{ .Values.org | quote }}
+              siteId: {{ .Values.siteId | quote }}
+              siteIPBlockID: {{ .Values.siteIpBlockId | quote }}
+              instanceTypeIds: [{{ .Values.instanceTypeId | quote }}]
+              networkMode: flat
+              identity:
+                platformIssued:
+                  enabled: true
+          ---
+          apiVersion: management.loft.sh/v1
+          kind: OSImage
+          metadata:
+            name: {{ .Values.osImageName }}
+          spec:
+            displayName: {{ .Values.osImageName | quote }}
+            properties:
+              nico.vcluster.com/os-image-url: {{ .Values.osImageUrl | quote }}
+              nico.vcluster.com/os-image-sha: {{ .Values.osImageSha | quote }}
+              nico.vcluster.com/os-image-disk: "/dev/sda"
+              nico.vcluster.com/os-image-rootfs-label: "cloudimg-rootfs"
+          ---
+          apiVersion: management.loft.sh/v1
+          kind: Tenant
+          metadata:
+            name: {{ .Values.tenantName }}
+            annotations:
+              # Must differ from the provider org or onboarding is refused.
+              nico.vcluster.com/org: {{ .Values.tenantOrg | quote }}
+              nico.vcluster.com/node-provider: {{ .Values.providerName | quote }}
+          spec:
+            displayName: {{ .Values.tenantName | quote }}
+            owner:
+              user: {{ .Values.owner | quote }}
+            nodeTypes:
+              enabled: true
+              allow:
+                byName:
+                  - {{ printf "%s.%s" .Values.providerName .Values.instanceTypeName | quote }}
+              # The quota becomes a NiCo compute allocation; keep it within the unreserved machines.
+              quota:
+                byType:
+                  {{ printf "%s.%s" .Values.providerName .Values.instanceTypeName | quote }}: {{ .Values.tenantQuota | quote }}
+          ---
+          apiVersion: management.loft.sh/v1
+          kind: NetworkEnvironment
+          metadata:
+            name: {{ .Values.networkEnvironmentName }}
+            labels:
+              tenant.vcluster.com/owner: {{ .Values.tenantName | quote }}
+          spec:
+            displayName: {{ .Values.networkEnvironmentName | quote }}
+            providerRef: {{ .Values.providerName | quote }}
+            owner:
+              user: {{ .Values.owner | quote }}
+      ---
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: {{ $n }}-run
+        namespace: {{ .Release.Namespace }}
+        annotations:
+          "helm.sh/hook": post-install,post-upgrade
+          "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+      spec:
+        backoffLimit: 0
+        activeDeadlineSeconds: 840
+        template:
+          spec:
+            serviceAccountName: {{ $n }}
+            restartPolicy: Never
+            volumes:
+              - name: objects
+                configMap: {name: {{ $n }}-objects}
+            containers:
+              - name: run
+                image: {{ .Values.hookImage | quote }}
+                env:
+                  - {name: PROVIDER, value: {{ .Values.providerName | quote }}}
+                  - {name: TENANT, value: {{ .Values.tenantName | quote }}}
+                  - {name: NE, value: {{ .Values.networkEnvironmentName | quote }}}
+                  - {name: SITE_ID, value: {{ .Values.siteId | quote }}}
+                volumeMounts:
+                  - {name: objects, mountPath: /objects}
+                command: [bash, -euo, pipefail, -c]
+                args:
+                  - |
+                    # siteId is immutable on a NodeProvider and a NetworkEnvironment is frozen once a tenant holds it:
+                    # an object created with other values is replaced, not patched.
+                    cur="$(kubectl get nodeproviders.management.loft.sh "${PROVIDER}" -o jsonpath='{.spec.nico.siteId}' 2>/dev/null || true)"
+                    if [[ -n "${cur}" && "${cur}" != "${SITE_ID}" ]]; then
+                      echo "provider ${PROVIDER} bound to site ${cur}, replacing"
+                      kubectl delete networkenvironments.management.loft.sh "${NE}" --ignore-not-found --timeout=120s
+                      kubectl delete nodeproviders.management.loft.sh "${PROVIDER}" --timeout=120s
+                    fi
+                    kubectl apply --server-side --force-conflicts -f /objects/objects.yaml
+                    for i in $(seq 1 60); do
+                      [[ "$(kubectl get nodeproviders.management.loft.sh "${PROVIDER}" -o jsonpath='{.status.phase}')" == Available ]] && break; sleep 10
+                    done
+                    kubectl get nodeproviders.management.loft.sh "${PROVIDER}" -o jsonpath='{"provider "}{.status.phase}{" "}{.status.message}{"\n"}'
+                    for i in $(seq 1 60); do
+                      kubectl get tenants.management.loft.sh "${TENANT}" -o json | jq -e '.status.conditions[]? | select(.type=="NICoOnboarded" and .status=="True")' >/dev/null && break; sleep 10
+                    done
+                    kubectl get tenants.management.loft.sh "${TENANT}" -o jsonpath='{"tenant conditions: "}{range .status.conditions[*]}{.type}={.status} {end}{"\n"}'
+                    for i in $(seq 1 60); do
+                      [[ "$(kubectl get networkenvironments.management.loft.sh "${NE}" -o jsonpath='{.status.phase}')" == Available ]] && break; sleep 10
+                    done
+                    kubectl get networkenvironments.management.loft.sh "${NE}" -o jsonpath='{"network environment "}{.status.phase}{"\n"}'
+                    kubectl get nodetypes.management.loft.sh -o name | grep "^nodetype.management.loft.sh/${PROVIDER}\." || { echo "no NodeType discovered for ${PROVIDER}" >&2; exit 1; }
+      ---
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: {{ $n }}-cleanup
+        namespace: {{ .Release.Namespace }}
+        annotations:
+          "helm.sh/hook": pre-delete
+          "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+      spec:
+        backoffLimit: 0
+        activeDeadlineSeconds: 600
+        template:
+          spec:
+            serviceAccountName: {{ $n }}
+            restartPolicy: Never
+            containers:
+              - name: run
+                image: {{ .Values.hookImage | quote }}
+                env:
+                  - {name: PROVIDER, value: {{ .Values.providerName | quote }}}
+                  - {name: TENANT, value: {{ .Values.tenantName | quote }}}
+                  - {name: NE, value: {{ .Values.networkEnvironmentName | quote }}}
+                  - {name: OSIMAGE, value: {{ .Values.osImageName | quote }}}
+                command: [bash, -euo, pipefail, -c]
+                args:
+                  - |
+                    if kubectl get nodeclaims.management.loft.sh -A -o json | jq -e --arg p "${PROVIDER}" '.items[] | select(.spec.providerRef==$p)' >/dev/null; then
+                      echo "NodeClaims still reference provider ${PROVIDER}; delete them first" >&2; exit 1
+                    fi
+                    kubectl delete networkenvironments.management.loft.sh "${NE}" --ignore-not-found --timeout=240s
+                    kubectl delete tenants.management.loft.sh "${TENANT}" --ignore-not-found --timeout=120s
+                    # the tenant's project and its namespace outlive the tenant
+                    kubectl delete projects.management.loft.sh -l "tenant.vcluster.com/owner=${TENANT}" --ignore-not-found --timeout=120s
+                    kubectl delete namespace "p-${TENANT}--default" --ignore-not-found --timeout=120s
+                    kubectl delete nodeproviders.management.loft.sh "${PROVIDER}" --ignore-not-found --timeout=120s
+                    kubectl delete osimages.management.loft.sh "${OSIMAGE}" --ignore-not-found

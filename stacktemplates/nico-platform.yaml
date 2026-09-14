@@ -1,0 +1,49 @@
+# Wires a NiCo site into the Platform: NodeProvider, OSImage, demo Tenant and its FLAT
+# NetworkEnvironment. Inputs are the nico-site stack's published outputs. Separate from nico-site
+# so the site can be rebuilt without tearing down Platform objects, and vice versa.
+apiVersion: management.loft.sh/v1
+kind: StackTemplate
+metadata:
+  name: nico-platform
+spec:
+  displayName: "NiCo Platform objects"
+  description: NodeProvider (networkMode flat, Platform-issued identity), OSImage, a demo Tenant with a quota on the NiCo instance type, and a NetworkEnvironment owned by that Tenant.
+  parameters:
+    - {variable: hookImage, type: string, required: true, label: "Image for hook Jobs"}
+    - {variable: providerName, type: string, required: true, defaultValue: "nico", label: "NodeProvider name", validation: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'}
+    - {variable: org, type: string, required: true, defaultValue: "ncx", label: "Provider org (as in the nico-site stack)"}
+    - {variable: restPort, type: string, required: true, defaultValue: "8388", label: "nico-rest-api port"}
+    - {variable: siteId, type: string, required: true, label: "Site id (nico-site output siteId)"}
+    - {variable: siteIpBlockId, type: string, required: true, label: "Site IP block id (nico-site output siteIPBlockID)"}
+    - {variable: instanceTypeId, type: string, required: true, label: "Instance type id (nico-site output instanceTypeId)"}
+    - {variable: instanceTypeName, type: string, required: true, defaultValue: "flat-demo-type", label: "Instance type name (NodeType becomes <provider>.<name>)"}
+    - {variable: osImageName, type: string, required: true, defaultValue: "ubuntu-noble-nico", label: "OSImage name"}
+    - {variable: osImageUrl, type: string, required: true, label: "OS image URL (qcow2 reachable from the machines)"}
+    - {variable: osImageSha, type: string, required: true, label: "OS image sha256"}
+    - {variable: tenantName, type: string, required: true, defaultValue: "nico-demo", label: "Tenant name"}
+    - {variable: tenantOrg, type: string, required: true, defaultValue: "vcluster-demo", label: "Tenant org (must differ from the provider org)"}
+    - {variable: tenantQuota, type: number, required: true, defaultValue: "1", label: "Tenant quota on the instance type"}
+    - {variable: networkEnvironmentName, type: string, required: true, defaultValue: "nico-flat", label: "NetworkEnvironment name"}
+    - {variable: owner, type: string, required: true, defaultValue: "admin", label: "Owner user of Tenant and NetworkEnvironment"}
+  tasks:
+    - name: objects
+      timeout: 15m
+      app:
+        templateRef: {name: nico-step-30-platform-objects}
+        parameters:
+          hookImage: "{{ .Values.hookImage }}"
+          providerName: "{{ .Values.providerName }}"
+          org: "{{ .Values.org }}"
+          restPort: "{{ .Values.restPort }}"
+          siteId: "{{ .Values.siteId }}"
+          siteIpBlockId: "{{ .Values.siteIpBlockId }}"
+          instanceTypeId: "{{ .Values.instanceTypeId }}"
+          instanceTypeName: "{{ .Values.instanceTypeName }}"
+          osImageName: "{{ .Values.osImageName }}"
+          osImageUrl: "{{ .Values.osImageUrl }}"
+          osImageSha: "{{ .Values.osImageSha }}"
+          tenantName: "{{ .Values.tenantName }}"
+          tenantOrg: "{{ .Values.tenantOrg }}"
+          tenantQuota: "{{ .Values.tenantQuota }}"
+          networkEnvironmentName: "{{ .Values.networkEnvironmentName }}"
+          owner: "{{ .Values.owner }}"

@@ -1,0 +1,358 @@
+# NiCo stack, core steps (09-10).
+---
+apiVersion: management.loft.sh/v1
+kind: App
+metadata:
+  name: nico-step-09-core
+  labels: {nico.vcluster.com/stack: "true"}
+spec:
+  displayName: "[NiCo 09] NiCo Core (site controller)"
+  description: The upstream nico chart with the zero-DPU, FLAT-VPC site config. Ten LoadBalancer VIPs pinned per Service.
+  defaultNamespace: nico-system
+  wait: true
+  timeout: 20m
+  config:
+    chart:
+      name: nico
+      version: "0.1.1"
+      repoURL: oci://registry.example.com/nico
+    values: |
+      {{- $ips := "lbipam.cilium.io/ips" }}{{- $share := "lbipam.cilium.io/sharing-key" }}
+      {{- if eq .Values.lbMode "metallb" }}{{ $ips = "metallb.universe.tf/loadBalancerIPs" }}{{ $share = "metallb.universe.tf/allow-shared-ip" }}{{ end }}
+      {{- $api := printf "api-%s.%s" .Values.siteName .Values.siteDomain }}
+      global:
+        image:
+          repository: {{ printf "%s/%s" .Values.imageRegistry .Values.coreImageName | quote }}
+          tag: {{ .Values.nicoVersion | quote }}
+      nico-api:
+        hostname: {{ $api | quote }}
+        auth:
+          additionalIssuerCns: ["site-root"]
+        componentManager: {enabled: false}
+        rms: {enabled: false}
+        externalService:
+          enabled: true
+          annotations:
+            {{ $ips }}: {{ .Values.vipApi | quote }}
+        certificate:
+          extraDnsNames:
+            - {{ $api | quote }}
+            - "carbide-api.forge"
+            - "nico-api.forge"
+            - "carbide-api.forge-system.svc.cluster.local"
+        bootArtifactContainers:
+          - name: boot-artifacts-x86-64
+            repository: {{ printf "%s/boot-artifacts-x86_64" .Values.imageRegistry | quote }}
+            tag: {{ .Values.nicoVersion | quote }}
+            command: ["sh", "-c", "cp -r /x86_64 /forge-boot-artifacts/blobs/internal"]
+        siteConfig:
+          enabled: true
+          nicoApiSiteConfig: |
+            sitename = {{ .Values.siteName | quote }}
+            initial_domain_name = {{ .Values.siteDomain | quote }}
+            attestation_enabled = false
+            max_concurrent_machine_updates = 20
+            tpm_required = false
+            dhcp_servers = [{{ .Values.vipDhcp | quote }}]
+            route_servers = []
+            enable_route_servers = false
+            site_fabric_prefixes = [{{ .Values.hostinbandPrefix | quote }}, {{ .Values.siteIpBlockCidr | quote }}]
+            deny_prefixes = [{{ .Values.oobPrefix | quote }}]
+            rack_management_enabled = false
+            allow_insecure_discovery = true
+            allow_bmc_basic_auth_fallback = true
+
+            [site_explorer]
+            dpu_policy = "ignore"
+            run_interval = "30s"
+            admin_segment_type_non_dpu = false
+
+            [machine_validation_config]
+            enabled = false
+
+            [bom_validation]
+            enabled = false
+            ignore_unassigned_machines = true
+
+            [pools.lo-ip]
+            type = "ipv4"
+            ranges = [{ start = "10.203.0.1", end = "10.203.0.254" }]
+
+            [pools.vlan-id]
+            type = "integer"
+            ranges = [{ start = "100", end = "501" }]
+
+            [pools.vni]
+            type = "integer"
+            ranges = [{ start = "1024500", end = "1024800" }]
+
+            [pools.vpc-vni]
+            type = "integer"
+            ranges = [{ start = "2024500", end = "2024800" }]
+
+            [pools.fnn-asn]
+            type = "integer"
+            ranges = [{ start = "4268060405", end = "4268060499" }]
+
+            [pools.external-vpc-vni]
+            type = "integer"
+            ranges = [{ start = "3024500", end = "3024800" }]
+
+            [networks.{{ .Values.oobName }}]
+            type = "underlay"
+            prefix = {{ .Values.oobPrefix | quote }}
+            gateway = {{ .Values.oobGateway | quote }}
+            mtu = 1500
+            reserve_first = 1
+
+            [networks.admin]
+            type = "admin"
+            prefix = "192.168.176.0/20"
+            gateway = "192.168.176.1"
+            mtu = 1500
+            reserve_first = 1
+
+            [networks.{{ .Values.hostinbandName }}]
+            type = "hostinband"
+            prefix = {{ .Values.hostinbandPrefix | quote }}
+            gateway = {{ .Values.hostinbandGateway | quote }}
+            mtu = 1500
+            reserve_first = {{ .Values.hostinbandReserveFirst }}
+            allocation_strategy = "dynamic"
+
+            [ib_config]
+            enabled = false
+
+            [firmware_global]
+            autoupdate = false
+            no_reset_retries = true
+
+            datacenter_asn = 4266030000
+
+            [machine_state_controller]
+            failure_retry_time = "5m"
+
+            [fnn.admin_vpc]
+            enabled = true
+            vpc_vni = 61325
+
+            [fnn.admin_vpc.routing_profile]
+            internal = true
+            route_target_imports = [{ asn = 4266030000, vni = 10 }]
+            route_targets_on_exports = [{ asn = 4266030000, vni = 50400 }]
+
+            [fnn.routing_profiles.INTERNAL]
+            internal = true
+            tenant_leak_communities_accepted = true
+            route_target_imports = [{ asn = 4266030000, vni = 11 }]
+            route_targets_on_exports = [{ asn = 4266030000, vni = 50200 }]
+
+            [fnn.routing_profiles.MAINTENANCE]
+            internal = true
+            route_target_imports = [{ asn = 4266030000, vni = 10 }, { asn = 4266030000, vni = 101 }, { asn = 4266030000, vni = 50100 }, { asn = 4266030000, vni = 121 }]
+            route_targets_on_exports = [{ asn = 4266030000, vni = 50300 }]
+
+            [fnn.routing_profiles.EXTERNAL]
+            internal = false
+            route_target_imports = [{ asn = 4266030000, vni = 50100 }]
+            route_targets_on_exports = [{ asn = 4266030000, vni = 50500 }]
+
+            [fnn.routing_profiles.PRIVILEGED_INTERNAL]
+            internal = true
+            route_target_imports = [{ asn = 4266030000, vni = 11 }, { asn = 4266030000, vni = 101 }, { asn = 4266030000, vni = 50100 }, { asn = 4266030000, vni = 900 }]
+            route_targets_on_exports = [{ asn = 4266030000, vni = 50100 }, { asn = 4266030000, vni = 50200 }]
+
+            [pools.vpc-dpu-lo]
+            type = "ipv4"
+            ranges = [{ start = "10.255.247.3", end = "10.255.247.255" }]
+      nico-dhcp:
+        enabled: true
+        externalService:
+          enabled: true
+          annotations:
+            {{ $ips }}: {{ .Values.vipDhcp | quote }}
+        config:
+          keaConfigJsonRaw: |
+            {
+              "Dhcp4": {
+                "interfaces-config": {"interfaces": ["eth0"], "dhcp-socket-type": "udp"},
+                "lease-database": {"type": "memfile", "lfc-interval": 3600},
+                "match-client-id": false,
+                "authoritative": false,
+                "renew-timer": 900,
+                "rebind-timer": 1800,
+                "valid-lifetime": 3600,
+                "decline-probation-period": 900,
+                "hooks-libraries": [{
+                  "library": "/usr/lib/x86_64-linux-gnu/kea/hooks/libdhcp.so",
+                  "parameters": {
+                    "nico-api-url": "https://__API_HOST__.__NAMESPACE__.svc.cluster.local:1079",
+                    "carbide-api-url": "https://__API_HOST__.__NAMESPACE__.svc.cluster.local:1079",
+                    "nico-metrics-endpoint": "[::]:1089",
+                    "carbide-metrics-endpoint": "[::]:1089",
+                    "nico-nameservers": "{{ .Values.vipUnbound }},{{ .Values.vipDns0 }}",
+                    "carbide-nameservers": "{{ .Values.vipUnbound }},{{ .Values.vipDns0 }}",
+                    "nico-ntpserver": "{{ .Values.vipNtp0 }},{{ .Values.vipNtp1 }},{{ .Values.vipNtp2 }}",
+                    "carbide-ntpserver": "{{ .Values.vipNtp0 }},{{ .Values.vipNtp1 }},{{ .Values.vipNtp2 }}",
+                    "nico-provisioning-server-ipv4": "{{ .Values.vipPxe }}",
+                    "carbide-provisioning-server-ipv4": "{{ .Values.vipPxe }}"
+                  }
+                }],
+                "client-classes": [{"name": "nico-machines", "test": "{{ .Values.macClassTest }}"}],
+                "subnet4": [{"subnet": "0.0.0.0/0", "pools": [{"pool": "0.0.0.0-255.255.255.255", "client-class": "nico-machines"}]}],
+                "loggers": [
+                  {"name": "kea-dhcp4", "severity": "INFO", "output_options": [{"output": "stdout"}]},
+                  {"name": "kea-dhcp4.hooks", "severity": "INFO", "output_options": [{"output": "stdout"}]},
+                  {"name": "kea-dhcp4.nico-rust", "severity": "INFO", "output_options": [{"output": "stdout"}]}
+                ]
+              }
+            }
+      nico-dns:
+        externalService:
+          enabled: true
+          perPodAnnotations:
+            - {{ $ips }}: {{ .Values.vipDns0 | quote }}
+              {{ $share }}: "nico-dns-instance-0"
+            - {{ $ips }}: {{ .Values.vipDns1 | quote }}
+              {{ $share }}: "nico-dns-instance-1"
+      nico-pxe:
+        enabled: true
+        bootArtifactContainers:
+          - name: boot-artifacts-x86-64
+            repository: {{ printf "%s/boot-artifacts-x86_64" .Values.imageRegistry | quote }}
+            tag: {{ .Values.nicoVersion | quote }}
+            command: ["sh", "-c", "cp -r /x86_64 /forge-boot-artifacts/blobs/internal"]
+        externalService:
+          enabled: true
+          annotations:
+            {{ $ips }}: {{ .Values.vipPxe | quote }}
+            {{ $share }}: "nico-pxe"
+      nico-ntp:
+        image: {repository: "dockurr/chrony", tag: "latest"}
+        externalService:
+          enabled: true
+          perPodAnnotations:
+            - {{ $ips }}: {{ .Values.vipNtp0 | quote }}
+            - {{ $ips }}: {{ .Values.vipNtp1 | quote }}
+            - {{ $ips }}: {{ .Values.vipNtp2 | quote }}
+      nico-ssh-console-rs:
+        externalService:
+          enabled: true
+          annotations:
+            {{ $ips }}: {{ .Values.vipSshConsole | quote }}
+      unbound:
+        enabled: true
+        image:
+          repository: "madnuttah/unbound"
+          tag: "latest@sha256:7bcb11b0c8c54a1b8807bb452b59f112791c42801c5cf43b98931d4b584275a1"
+        exporter: {enabled: false}
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            printf 'server:\n  interface: 0.0.0.0\n  interface: ::0\n  access-control: 0.0.0.0/0 allow\ninclude: "/etc/unbound/local.conf.d/*.conf"\n' > /unbound.conf
+            exec unbound -d -c /unbound.conf
+        localConfig:
+          forwarders.conf: |
+            forward-zone:
+                name: "{{ .Values.siteDomain }}."
+                forward-addr: {{ .Values.vipDns0 }}
+                forward-addr: {{ .Values.vipDns1 }}
+            forward-zone:
+                name: "{{ .Values.hostinbandReverseZone }}."
+                forward-addr: {{ .Values.vipDns0 }}
+                forward-addr: {{ .Values.vipDns1 }}
+            forward-zone:
+                name: "."
+                forward-addr: 8.8.8.8
+                forward-addr: 1.1.1.1
+        localData:
+          - {name: carbide-static-pxe.forge, addresses: [{{ .Values.vipPxe | quote }}]}
+          - {name: carbide-pxe.forge, addresses: [{{ .Values.vipPxe | quote }}]}
+          - {name: carbide-api.forge, addresses: [{{ .Values.vipApi | quote }}]}
+          - {name: nico-api.forge, addresses: [{{ .Values.vipApi | quote }}]}
+        externalService:
+          enabled: true
+          annotations:
+            {{ $ips }}: {{ .Values.vipUnbound | quote }}
+            {{ $share }}: "unbound-external"
+      nico-dsx-exchange-consumer: {enabled: false}
+      nico-machine-a-tron: {enabled: false}
+---
+apiVersion: management.loft.sh/v1
+kind: App
+metadata:
+  name: nico-step-10-core-post
+  labels: {nico.vcluster.com/stack: "true"}
+spec:
+  displayName: "[NiCo 10] After Core: pin edge pods, seed BMC and UEFI credentials"
+  description: Pins nico-api/pxe/dhcp to the node the Cilium L2 policy announces from (no-op when edgeNode is empty), then seeds Vault. machines/bmc/site/root must exist or check_preconditions aborts with MissingCredentials; the site password must differ from the BMC's own or rotation is a no-op.
+  defaultNamespace: nico-system
+  wait: true
+  timeout: 10m
+  config:
+    manifests: |
+      {{- $n := .Release.Name }}
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata: {name: {{ $n }}, namespace: {{ .Release.Namespace }}}
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata: {name: nico-stack-{{ $n }}}
+      subjects: [{kind: ServiceAccount, name: {{ $n }}, namespace: {{ .Release.Namespace }}}]
+      roleRef: {kind: ClusterRole, name: cluster-admin, apiGroup: rbac.authorization.k8s.io}
+      ---
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: {{ $n }}-run
+        namespace: {{ .Release.Namespace }}
+        annotations:
+          "helm.sh/hook": post-install,post-upgrade
+          "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+      spec:
+        backoffLimit: 0
+        activeDeadlineSeconds: 540
+        template:
+          spec:
+            serviceAccountName: {{ $n }}
+            restartPolicy: Never
+            containers:
+              - name: run
+                image: {{ .Values.hookImage | quote }}
+                env:
+                  - {name: BMC_USER, value: {{ .Values.bmcUsername | quote }}}
+                  - {name: BMC_PASS, value: {{ .Values.bmcPassword | quote }}}
+                  - {name: BMC_SITE_PASS, value: {{ .Values.bmcSitePassword | quote }}}
+                  - {name: UEFI_PASS, value: {{ .Values.uefiPassword | quote }}}
+                  - {name: MACHINES, value: {{ .Values.machineNames | quote }}}
+                  - {name: BMC_MAC_PREFIX, value: {{ .Values.bmcMacPrefix | quote }}}
+                  - {name: EDGE_NODE, value: {{ .Values.edgeNode | quote }}}
+                command: [bash, -euo, pipefail, -c]
+                args:
+                  - |
+                    if [[ -n "${EDGE_NODE}" ]]; then
+                      for d in nico-api nico-pxe nico-dhcp; do
+                        kubectl patch deploy -n nico-system "${d}" -p "{\"spec\":{\"template\":{\"spec\":{\"nodeSelector\":{\"kubernetes.io/hostname\":\"${EDGE_NODE}\"}}}}}"
+                        kubectl rollout status deploy -n nico-system "${d}" --timeout=180s
+                      done
+                    fi
+                    TOKEN="$(kubectl get secret -n nico-system nico-vault-token -o jsonpath='{.data.token}' | base64 -d)"
+                    vx() { kubectl exec -i -n vault vault-0 -c vault -- sh -c "export VAULT_TOKEN='${TOKEN}' VAULT_ADDR=https://127.0.0.1:8200 VAULT_SKIP_VERIFY=true; $1"; }
+                    get() { vx "vault kv get -format=json secrets/$1" 2>/dev/null | jq -r '.data.data.UsernamePassword | "\(.username)\t\(.password)"' 2>/dev/null || true; }
+                    put() { printf '{"UsernamePassword":{"username":"%s","password":"%s"}}\n' "$2" "$3" | vx "vault kv put secrets/$1 -" >/dev/null; echo "seeded $1"; }
+                    for v in unknown ami; do put "machines/all_hosts/factory_default/bmc-metadata-items/${v}" "${BMC_USER}" "${BMC_PASS}"; done
+                    put machines/all_dpus/factory_default/bmc-metadata-items/root root 0penBmc
+                    cur="$(get machines/bmc/site/root)"
+                    if [[ "$(cut -f1 <<<"${cur}")" != "${BMC_USER}" || -z "$(cut -f2 <<<"${cur}")" || "$(cut -f2 <<<"${cur}")" == "${BMC_PASS}" ]]; then
+                      put machines/bmc/site/root "${BMC_USER}" "${BMC_SITE_PASS}"
+                    fi
+                    for p in machines/all_hosts/site_default/uefi-metadata-items/auth machines/all_dpus/site_default/uefi-metadata-items/auth; do
+                      [[ -n "$(get "${p}" | cut -f2)" ]] || put "${p}" admin "${UEFI_PASS}"
+                    done
+                    # Per-endpoint credentials, one per BMC MAC (<prefix>:01, :02, ...).
+                    i=0
+                    for m in ${MACHINES}; do
+                      i=$((i + 1)); mac="$(printf '%s:%02x' "${BMC_MAC_PREFIX}" "${i}" | tr 'A-Z' 'a-z')"
+                      [[ "$(get "machines/bmc/${mac}/root")" == "$(printf '%s\t%s' "${BMC_USER}" "${BMC_PASS}")" ]] || put "machines/bmc/${mac}/root" "${BMC_USER}" "${BMC_PASS}"
+                    done

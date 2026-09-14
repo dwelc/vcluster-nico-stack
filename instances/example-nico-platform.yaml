@@ -1,0 +1,30 @@
+# Platform objects for the site. `make platform` fills siteId, siteIpBlockId and instanceTypeId from
+# the nico-site instance's published outputs before applying.
+apiVersion: management.loft.sh/v1
+kind: StackInstance
+metadata:
+  name: nico-platform
+  namespace: p-default
+spec:
+  displayName: "NiCo Platform objects"
+  destination:
+    cluster:
+      name: loft-cluster
+  templateRef:
+    name: nico-platform
+  owner:
+    user: admin
+  parameters:
+    hookImage: registry.example.com/nico/hook:1.33.4
+    providerName: nico
+    org: ncx
+    siteId: 00000000-0000-0000-0000-000000000000
+    siteIpBlockId: 00000000-0000-0000-0000-000000000000
+    instanceTypeId: 00000000-0000-0000-0000-000000000000
+    osImageName: ubuntu-noble-nico
+    osImageUrl: http://images.example.com/ubuntu-24.04-server-cloudimg-amd64.img   # reachable from the machines
+    osImageSha: 0000000000000000000000000000000000000000000000000000000000000000
+    tenantName: nico-demo
+    tenantOrg: vcluster-demo        # must differ from the provider org
+    networkEnvironmentName: nico-flat
+    owner: admin

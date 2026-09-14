@@ -1,0 +1,348 @@
+# A NiCo site (zero-DPU, FLAT VPC) on a connected cluster, from postgres-operator to attached machines.
+# Every task is a catalog App from ../apps; this template only wires parameters, order and outputs.
+# Task names that publish outputs are letters and digits only (referenced as .Outputs.<task>.<name>).
+apiVersion: management.loft.sh/v1
+kind: StackTemplate
+metadata:
+  name: nico-site
+spec:
+  displayName: "NiCo site (zero-DPU, FLAT)"
+  description: >-
+    NVIDIA Infra Controller as a vCluster Platform Stack: postgres-operator, Vault (init and unseal),
+    External Secrets, nico-prereqs, NiCo Core, the REST stack with Temporal trusting Platform-issued
+    tokens, site registration, site-agent, and day 0 (credentials, machines, segment, instance type,
+    IP block). Publishes the siteId, siteIPBlockID and instanceTypeId a NodeProvider needs.
+  parameters:
+    # --- registry and versions
+    - {variable: chartRegistry, type: string, required: true, label: "OCI registry holding the NiCo charts", placeholder: "oci://harbor.example.com/nico"}
+    - {variable: hookImage, type: string, required: true, label: "Image for hook Jobs (kubectl, helm, jq, curl, openssl, ssh-keygen)", placeholder: "harbor.example.com/nico/hook:1.33.4"}
+    - {variable: imageRegistry, type: string, required: true, defaultValue: "ghcr.io/janekbaraniewski", label: "NiCo image registry"}
+    - {variable: coreImageName, type: string, required: true, defaultValue: "nvmetal-carbide", label: "Core image name"}
+    - {variable: nicoVersion, type: string, required: true, defaultValue: "v2.1.0-rc.8", label: "NiCo image tag"}
+    - {variable: prereqsChartVersion, type: string, required: true, defaultValue: "0.1.0", label: "nico-prereqs chart version"}
+    # --- cluster
+    - {variable: storageClass, type: string, required: true, label: "Retain-capable StorageClass", validation: '^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$'}
+    - {variable: certManagerNamespace, type: string, required: true, defaultValue: "cert-manager", label: "cert-manager namespace"}
+    - {variable: platformNamespace, type: string, required: true, defaultValue: "vcluster-platform", label: "vCluster Platform namespace"}
+    - {variable: loftHost, type: string, required: true, label: "Platform hostname (token issuer is https://<host>/oidc)", validation: '^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$'}
+    - variable: lbMode
+      label: "LoadBalancer"
+      description: cilium pins VIPs with LB-IPAM annotations and announces nico-system only from edgeNode; metallb creates pools and an L2Advertisement.
+      type: string
+      required: true
+      defaultValue: cilium
+      options: [cilium, metallb]
+    - {variable: edgeNode, type: string, label: "Node that announces the VIPs and runs nico-api/pxe/dhcp (cilium)"}
+    - {variable: l2Interface, type: string, defaultValue: "eth0", label: "Interface for L2 announcements (cilium)"}
+    - {variable: metallbNamespace, type: string, defaultValue: "metallb-system", label: "MetalLB namespace (metallb)"}
+    - {variable: lbInternalRange, type: string, defaultValue: "198.51.100.236-198.51.100.244", label: "MetalLB internal pool (metallb)"}
+    - {variable: lbExternalRange, type: string, defaultValue: "198.51.100.245-198.51.100.245", label: "MetalLB external pool (metallb)"}
+    - {variable: postgresInstances, type: number, defaultValue: "3", min: 2, label: "Postgres instances (Patroni strict sync needs 2+)"}
+    - {variable: vaultReplicas, type: number, defaultValue: "3", min: 1, label: "Vault replicas"}
+    - {variable: siteAgentReplicas, type: number, defaultValue: "1", min: 1, label: "site-agent replicas"}
+    # --- site identity
+    - {variable: siteName, type: string, required: true, defaultValue: "lab", label: "Site name", validation: '^[A-Za-z0-9][A-Za-z0-9._-]*$'}
+    - {variable: siteDomain, type: string, required: true, defaultValue: "lab.nico", label: "Site DNS domain"}
+    - {variable: org, type: string, required: true, defaultValue: "ncx", label: "Provider org", validation: '^[A-Za-z0-9][A-Za-z0-9._-]*$'}
+    - {variable: restPort, type: string, required: true, defaultValue: "8388", label: "nico-rest-api port"}
+    # --- networks
+    - {variable: hostinbandName, type: string, required: true, defaultValue: "demo-inband", label: "HostInband segment name"}
+    - {variable: hostinbandPrefix, type: string, required: true, label: "HostInband prefix (the VM L2 segment)", placeholder: "192.0.2.0/24"}
+    - {variable: hostinbandGateway, type: string, required: true, label: "HostInband gateway", placeholder: "192.0.2.1"}
+    - {variable: hostinbandReserveFirst, type: number, required: true, defaultValue: "50", label: "Addresses reserved before NiCo's dynamic range"}
+    - {variable: hostinbandReverseZone, type: string, required: true, label: "Reverse zone of the HostInband /24", placeholder: "2.0.192.in-addr.arpa"}
+    - {variable: oobName, type: string, required: true, defaultValue: "demo-oob", label: "BMC/OOB segment name"}
+    - {variable: oobPrefix, type: string, required: true, label: "BMC/OOB prefix (where the BMCs listen)", placeholder: "198.51.100.0/24"}
+    - {variable: oobGateway, type: string, required: true, label: "BMC/OOB gateway", placeholder: "198.51.100.1"}
+    - {variable: siteIpBlockCidr, type: string, required: true, defaultValue: "10.210.0.0/24", label: "Site IP block CIDR (unused by FLAT, required by the NodeProvider)"}
+    - {variable: vipDhcp, type: string, required: true, label: "VIP: DHCP (Kea)"}
+    - {variable: vipDns0, type: string, required: true, label: "VIP: DNS 0"}
+    - {variable: vipDns1, type: string, required: true, label: "VIP: DNS 1"}
+    - {variable: vipPxe, type: string, required: true, label: "VIP: PXE/HTTP boot"}
+    - {variable: vipNtp0, type: string, required: true, label: "VIP: NTP 0"}
+    - {variable: vipNtp1, type: string, required: true, label: "VIP: NTP 1"}
+    - {variable: vipNtp2, type: string, required: true, label: "VIP: NTP 2"}
+    - {variable: vipSshConsole, type: string, required: true, label: "VIP: ssh console"}
+    - {variable: vipUnbound, type: string, required: true, label: "VIP: unbound resolver"}
+    - {variable: vipApi, type: string, required: true, label: "VIP: nico-api"}
+    - {variable: macClassTest, type: string, required: true, defaultValue: "substring(pkt4.mac,3,1) == 0xbb", label: "Kea client-class test selecting NiCo machines"}
+    # --- machines
+    - {variable: machineNames, type: string, required: true, label: "Machine names, space separated (libvirt domain names)", placeholder: "nico-vm-1 nico-vm-2"}
+    - {variable: bmcIps, type: string, required: true, label: "BMC addresses, space separated, same order", placeholder: "198.51.100.202 198.51.100.203"}
+    - {variable: bmcMacPrefix, type: string, required: true, defaultValue: "02:00:00:00:0B", label: "Synthetic BMC MAC prefix (<prefix>:01, :02 ...)"}
+    - {variable: dataMacPrefix, type: string, required: true, defaultValue: "52:54:00:BB:00", label: "VM NIC MAC prefix (<prefix>:00, :01 ...)"}
+    - {variable: serialPrefix, type: string, required: true, defaultValue: "NICO-VM-", label: "Chassis serial prefix (<prefix><N>)"}
+    - {variable: bmcUsername, type: string, required: true, defaultValue: "admin", label: "BMC username"}
+    - {variable: bmcPassword, type: password, required: true, label: "BMC password"}
+    - {variable: bmcSitePassword, type: password, required: true, defaultValue: "NicoSiteRoot1", label: "Site BMC password (must differ)"}
+    - {variable: uefiPassword, type: password, required: true, defaultValue: "bluefield", label: "UEFI password"}
+    - {variable: machineWaitSeconds, type: number, defaultValue: "1800", label: "Ingestion wait (seconds)"}
+    - {variable: instanceTypeName, type: string, required: true, defaultValue: "flat-demo-type", label: "Instance type name"}
+    - {variable: ipBlockName, type: string, required: true, defaultValue: "flat-demo-ipblock", label: "Site IP block name"}
+    - {variable: ipBlockPrefix, type: string, required: true, defaultValue: "10.210.0.0", label: "Site IP block prefix"}
+    - {variable: ipBlockPrefixLength, type: number, required: true, defaultValue: "24", label: "Site IP block prefix length"}
+
+  tasks:
+    - name: namespaces
+      timeout: 2m
+      app:
+        templateRef: {name: nico-step-00-namespaces}
+
+    - name: postgresoperator
+      dependsOn: [namespaces]
+      timeout: 10m
+      app:
+        templateRef: {name: nico-step-01-postgres-operator}
+
+    - name: lb
+      dependsOn: [namespaces]
+      timeout: 2m
+      app:
+        templateRef: {name: nico-step-02-lb}
+        parameters:
+          lbMode: "{{ .Values.lbMode }}"
+          edgeNode: "{{ .Values.edgeNode }}"
+          l2Interface: "{{ .Values.l2Interface }}"
+          metallbNamespace: "{{ .Values.metallbNamespace }}"
+          lbInternalRange: "{{ .Values.lbInternalRange }}"
+          lbExternalRange: "{{ .Values.lbExternalRange }}"
+
+    - name: certs
+      dependsOn: [namespaces]
+      timeout: 10m
+      app:
+        templateRef: {name: nico-step-03-certs}
+        parameters:
+          hookImage: "{{ .Values.hookImage }}"
+          chartRegistry: "{{ .Values.chartRegistry }}"
+          prereqsChartVersion: "{{ .Values.prereqsChartVersion }}"
+          nicoVersion: "{{ .Values.nicoVersion }}"
+          certManagerNamespace: "{{ .Values.certManagerNamespace }}"
+
+    - name: vault
+      # externalsecrets is a dependency so its webhook outlives the nico-system teardown (vaultinit's cleanup).
+      dependsOn: [certs, externalsecrets]
+      timeout: 10m
+      app:
+        templateRef: {name: nico-step-04-vault}
+        parameters:
+          storageClass: "{{ .Values.storageClass }}"
+          vaultReplicas: "{{ .Values.vaultReplicas }}"
+
+    - name: vaultinit
+      dependsOn: [vault]
+      timeout: 15m
+      app:
+        templateRef: {name: nico-step-05-vault-init}
+        parameters:
+          hookImage: "{{ .Values.hookImage }}"
+          vaultReplicas: "{{ .Values.vaultReplicas }}"
+      outputs:
+        - name: roottoken
+          fromSecret: {namespace: vault, name: vaultroottoken, key: token}
+
+    - name: externalsecrets
+      dependsOn: [namespaces]
+      timeout: 10m
+      app:
+        templateRef: {name: nico-step-06-external-secrets}
+
+    - name: prereqs
+      dependsOn: [postgresoperator, vaultinit, externalsecrets]
+      timeout: 15m
+      app:
+        templateRef: {name: nico-step-07-prereqs}
+        parameters:
+          chartRegistry: "{{ .Values.chartRegistry }}"
+          siteName: "{{ .Values.siteName }}"
+          certManagerNamespace: "{{ .Values.certManagerNamespace }}"
+          storageClass: "{{ .Values.storageClass }}"
+          postgresInstances: "{{ .Values.postgresInstances }}"
+          vaultToken: "{{ .Outputs.vaultinit.roottoken }}"
+
+    - name: prereqsready
+      dependsOn: [prereqs]
+      timeout: 20m
+      app:
+        templateRef: {name: nico-step-08-prereqs-ready}
+        parameters:
+          hookImage: "{{ .Values.hookImage }}"
+      outputs:
+        - name: pguser
+          fromSecret: {namespace: nico-rest, name: nico-rest-pg-creds, key: username}
+        - name: pgpassword
+          fromSecret: {namespace: nico-rest, name: nico-rest-pg-creds, key: password}
+
+    - name: core
+      dependsOn: [prereqsready, lb]
+      timeout: 20m
+      app:
+        templateRef: {name: nico-step-09-core}
+        parameters:
+          chartRegistry: "{{ .Values.chartRegistry }}"
+          imageRegistry: "{{ .Values.imageRegistry }}"
+          coreImageName: "{{ .Values.coreImageName }}"
+          nicoVersion: "{{ .Values.nicoVersion }}"
+          lbMode: "{{ .Values.lbMode }}"
+          siteName: "{{ .Values.siteName }}"
+          siteDomain: "{{ .Values.siteDomain }}"
+          hostinbandName: "{{ .Values.hostinbandName }}"
+          hostinbandPrefix: "{{ .Values.hostinbandPrefix }}"
+          hostinbandGateway: "{{ .Values.hostinbandGateway }}"
+          hostinbandReserveFirst: "{{ .Values.hostinbandReserveFirst }}"
+          hostinbandReverseZone: "{{ .Values.hostinbandReverseZone }}"
+          oobName: "{{ .Values.oobName }}"
+          oobPrefix: "{{ .Values.oobPrefix }}"
+          oobGateway: "{{ .Values.oobGateway }}"
+          siteIpBlockCidr: "{{ .Values.siteIpBlockCidr }}"
+          vipDhcp: "{{ .Values.vipDhcp }}"
+          vipDns0: "{{ .Values.vipDns0 }}"
+          vipDns1: "{{ .Values.vipDns1 }}"
+          vipPxe: "{{ .Values.vipPxe }}"
+          vipNtp0: "{{ .Values.vipNtp0 }}"
+          vipNtp1: "{{ .Values.vipNtp1 }}"
+          vipNtp2: "{{ .Values.vipNtp2 }}"
+          vipSshConsole: "{{ .Values.vipSshConsole }}"
+          vipUnbound: "{{ .Values.vipUnbound }}"
+          vipApi: "{{ .Values.vipApi }}"
+          macClassTest: "{{ .Values.macClassTest }}"
+
+    - name: corepost
+      dependsOn: [core]
+      timeout: 10m
+      app:
+        templateRef: {name: nico-step-10-core-post}
+        parameters:
+          hookImage: "{{ .Values.hookImage }}"
+          edgeNode: "{{ .Values.edgeNode }}"
+          bmcUsername: "{{ .Values.bmcUsername }}"
+          bmcPassword: "{{ .Values.bmcPassword }}"
+          bmcSitePassword: "{{ .Values.bmcSitePassword }}"
+          uefiPassword: "{{ .Values.uefiPassword }}"
+          machineNames: "{{ .Values.machineNames }}"
+          bmcMacPrefix: "{{ .Values.bmcMacPrefix }}"
+
+    - name: restbootstrap
+      dependsOn: [certs]
+      timeout: 10m
+      app:
+        templateRef: {name: nico-step-12-rest-bootstrap}
+        parameters:
+          storageClass: "{{ .Values.storageClass }}"
+
+    - name: temporal
+      dependsOn: [restbootstrap]
+      timeout: 15m
+      app:
+        templateRef: {name: nico-step-14-temporal}
+        parameters:
+          chartRegistry: "{{ .Values.chartRegistry }}"
+
+    - name: temporalns
+      dependsOn: [temporal]
+      timeout: 10m
+      app:
+        templateRef: {name: nico-step-15-temporal-namespaces}
+        parameters:
+          hookImage: "{{ .Values.hookImage }}"
+          temporalNamespaces: "cloud site flow"
+
+    - name: rest
+      dependsOn: [prereqsready, temporalns]
+      timeout: 15m
+      app:
+        templateRef: {name: nico-step-16-rest}
+        parameters:
+          chartRegistry: "{{ .Values.chartRegistry }}"
+          imageRegistry: "{{ .Values.imageRegistry }}"
+          nicoVersion: "{{ .Values.nicoVersion }}"
+          platformNamespace: "{{ .Values.platformNamespace }}"
+          loftHost: "{{ .Values.loftHost }}"
+          restPort: "{{ .Values.restPort }}"
+          pgUser: "{{ .Outputs.prereqsready.pguser }}"
+          pgPassword: "{{ .Outputs.prereqsready.pgpassword }}"
+
+    - name: site
+      dependsOn: [rest]
+      timeout: 10m
+      app:
+        templateRef: {name: nico-step-17-site}
+        parameters:
+          hookImage: "{{ .Values.hookImage }}"
+          siteName: "{{ .Values.siteName }}"
+          org: "{{ .Values.org }}"
+          platformNamespace: "{{ .Values.platformNamespace }}"
+          loftHost: "{{ .Values.loftHost }}"
+          restPort: "{{ .Values.restPort }}"
+      outputs:
+        - name: siteid
+          fromSecret: {namespace: nico-rest, name: nico-site, key: id}
+
+    - name: siteagent
+      dependsOn: [site, core]
+      timeout: 15m
+      app:
+        templateRef: {name: nico-step-18-site-agent}
+        parameters:
+          chartRegistry: "{{ .Values.chartRegistry }}"
+          imageRegistry: "{{ .Values.imageRegistry }}"
+          nicoVersion: "{{ .Values.nicoVersion }}"
+          siteAgentReplicas: "{{ .Values.siteAgentReplicas }}"
+          siteId: "{{ .Outputs.site.siteid }}"
+
+    - name: day0machines
+      dependsOn: [corepost]
+      timeout: 60m
+      app:
+        templateRef: {name: nico-step-21-day0-machines}
+        parameters:
+          hookImage: "{{ .Values.hookImage }}"
+          machineNames: "{{ .Values.machineNames }}"
+          bmcIps: "{{ .Values.bmcIps }}"
+          bmcMacPrefix: "{{ .Values.bmcMacPrefix }}"
+          dataMacPrefix: "{{ .Values.dataMacPrefix }}"
+          serialPrefix: "{{ .Values.serialPrefix }}"
+          bmcUsername: "{{ .Values.bmcUsername }}"
+          bmcPassword: "{{ .Values.bmcPassword }}"
+          siteName: "{{ .Values.siteName }}"
+          siteDomain: "{{ .Values.siteDomain }}"
+          imageRegistry: "{{ .Values.imageRegistry }}"
+          coreImageName: "{{ .Values.coreImageName }}"
+          nicoVersion: "{{ .Values.nicoVersion }}"
+          machineWaitSeconds: "{{ .Values.machineWaitSeconds }}"
+          hostinbandName: "{{ .Values.hostinbandName }}"
+          hostinbandPrefix: "{{ .Values.hostinbandPrefix }}"
+          hostinbandGateway: "{{ .Values.hostinbandGateway }}"
+          hostinbandReserveFirst: "{{ .Values.hostinbandReserveFirst }}"
+
+    - name: day0rest
+      dependsOn: [day0machines, siteagent]
+      timeout: 40m
+      app:
+        templateRef: {name: nico-step-23-day0-rest}
+        parameters:
+          hookImage: "{{ .Values.hookImage }}"
+          siteId: "{{ .Outputs.site.siteid }}"
+          org: "{{ .Values.org }}"
+          platformNamespace: "{{ .Values.platformNamespace }}"
+          loftHost: "{{ .Values.loftHost }}"
+          restPort: "{{ .Values.restPort }}"
+          instanceTypeName: "{{ .Values.instanceTypeName }}"
+          ipBlockName: "{{ .Values.ipBlockName }}"
+          ipBlockPrefix: "{{ .Values.ipBlockPrefix }}"
+          ipBlockPrefixLength: "{{ .Values.ipBlockPrefixLength }}"
+          machineNames: "{{ .Values.machineNames }}"
+          machineWaitSeconds: "{{ .Values.machineWaitSeconds }}"
+      outputs:
+        - name: instancetypeid
+          fromSecret: {namespace: nico-rest, name: nico-day0, key: instanceTypeId}
+        - name: ipblockid
+          fromSecret: {namespace: nico-rest, name: nico-day0, key: ipBlockId}
+
+  publishedOutputs:
+    - name: siteId
+      fromTask: {task: site, output: siteid}
+    - name: siteIPBlockID
+      fromTask: {task: day0rest, output: ipblockid}
+    - name: instanceTypeId
+      fromTask: {task: day0rest, output: instancetypeid}

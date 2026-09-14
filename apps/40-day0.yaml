@@ -1,0 +1,245 @@
+# NiCo stack, day-0 steps (21, 23): machines and segment, then instance type and IP block. Credentials are seeded in step 10.
+---
+apiVersion: management.loft.sh/v1
+kind: App
+metadata:
+  name: nico-step-21-day0-machines
+  labels: {nico.vcluster.com/stack: "true"}
+spec:
+  displayName: "[NiCo 21] Day 0: register machines, wait for ingestion, HostInband segment"
+  description: ExpectedMachine entries with fixed BMC addresses through the admin CLI (run as Jobs with the carbide image), waits for site-explorer to ingest every machine (re-arming it after a stall), then creates the HostInband segment through the runtime API (config-driven creation is bootstrap-once).
+  defaultNamespace: nico-system
+  wait: true
+  timeout: 60m
+  config:
+    manifests: |
+      {{- $n := .Release.Name }}
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata: {name: {{ $n }}, namespace: {{ .Release.Namespace }}}
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata: {name: nico-stack-{{ $n }}}
+      subjects: [{kind: ServiceAccount, name: {{ $n }}, namespace: {{ .Release.Namespace }}}]
+      roleRef: {kind: ClusterRole, name: cluster-admin, apiGroup: rbac.authorization.k8s.io}
+      ---
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: {{ $n }}-run
+        namespace: {{ .Release.Namespace }}
+        annotations:
+          "helm.sh/hook": post-install,post-upgrade
+          "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+      spec:
+        backoffLimit: 0
+        activeDeadlineSeconds: 3540
+        template:
+          spec:
+            serviceAccountName: {{ $n }}
+            restartPolicy: Never
+            containers:
+              - name: run
+                image: {{ .Values.hookImage | quote }}
+                env:
+                  - {name: MACHINES, value: {{ .Values.machineNames | quote }}}
+                  - {name: BMC_IPS, value: {{ .Values.bmcIps | quote }}}
+                  - {name: BMC_MAC_PREFIX, value: {{ .Values.bmcMacPrefix | quote }}}
+                  - {name: DATA_MAC_PREFIX, value: {{ .Values.dataMacPrefix | quote }}}
+                  - {name: SERIAL_PREFIX, value: {{ .Values.serialPrefix | quote }}}
+                  - {name: BMC_USER, value: {{ .Values.bmcUsername | quote }}}
+                  - {name: BMC_PASS, value: {{ .Values.bmcPassword | quote }}}
+                  - {name: API_HOSTNAME, value: {{ printf "api-%s.%s" .Values.siteName .Values.siteDomain | quote }}}
+                  - {name: CLI_IMAGE, value: {{ printf "%s/%s:%s" .Values.imageRegistry .Values.coreImageName .Values.nicoVersion | quote }}}
+                  - {name: WAIT, value: {{ .Values.machineWaitSeconds | default "1800" | quote }}}
+                  - {name: SEG_NAME, value: {{ .Values.hostinbandName | quote }}}
+                  - {name: SEG_PREFIX, value: {{ .Values.hostinbandPrefix | quote }}}
+                  - {name: SEG_GW, value: {{ .Values.hostinbandGateway | quote }}}
+                  - {name: SEG_RESERVE, value: {{ .Values.hostinbandReserveFirst | quote }}}
+                command: [bash, -euo, pipefail, -c]
+                args:
+                  - |
+                    TOKEN="$(kubectl get secret -n nico-system nico-vault-token -o jsonpath='{.data.token}' | base64 -d)"
+                    vx() { kubectl exec -i -n vault vault-0 -c vault -- sh -c "export VAULT_TOKEN='${TOKEN}' VAULT_ADDR=https://127.0.0.1:8200 VAULT_SKIP_VERIFY=true; $1"; }
+                    sql() { local p; p="$(kubectl get pods -n postgres -l application=spilo,spilo-role=master -o jsonpath='{.items[0].metadata.name}')"
+                            kubectl exec -i -n postgres "${p}" -c postgres -- sh -c "exec su postgres -c 'psql -d nico_system_nico -v ON_ERROR_STOP=1 -tA -f -'"; }
+                    count() { printf '%s' "$1" | sql | tr -dc '0-9'; }
+                    # Admin CLI client certificate from the site PKI, valid for this run.
+                    API_IP="$(kubectl get svc -n nico-system nico-api -o jsonpath='{.spec.clusterIP}')"
+                    cert="$(vx "vault write -format=json nicoca/issue/nico-cluster common_name='${API_HOSTNAME}' ttl=4h")"
+                    kubectl create secret generic nico-day0-admincli-cert -n nico-system \
+                      --from-literal=client.crt="$(jq -r .data.certificate <<<"${cert}")" --from-literal=client.key="$(jq -r .data.private_key <<<"${cert}")" \
+                      --from-literal=ca.crt="$(jq -r .data.issuing_ca <<<"${cert}")" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+                    seq_=0
+                    cli() { # name args... -> runs the admin CLI as a Job against nico-api's ClusterIP
+                      local name="$1"; shift; seq_=$((seq_ + 1))
+                      local job; job="$(printf 'nico-day0-%s-%d' "${name}" "${seq_}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | cut -c1-50 | sed 's/-*$//')"
+                      kubectl delete job "${job}" -n nico-system --ignore-not-found >/dev/null 2>&1
+                      jq -n --arg job "${job}" --arg ip "${API_IP}" --arg host "${API_HOSTNAME}" --arg img "${CLI_IMAGE}" --argjson args "$(printf '%s\n' "$@" | jq -R . | jq -sc .)" \
+                        '{apiVersion:"batch/v1",kind:"Job",metadata:{name:$job,namespace:"nico-system"},spec:{backoffLimit:0,activeDeadlineSeconds:300,ttlSecondsAfterFinished:900,
+                          template:{spec:{restartPolicy:"Never",hostAliases:[{ip:$ip,hostnames:[$host]}],volumes:[{name:"cert",secret:{secretName:"nico-day0-admincli-cert"}}],
+                          containers:[{name:"admincli",image:$img,command:["/opt/carbide/nico-admin-cli"],args:$args,
+                          env:[{name:"API_URL",value:("https://"+$host+":1079")},{name:"ROOT_CA_PATH",value:"/certs/ca.crt"},{name:"CLIENT_CERT_PATH",value:"/certs/client.crt"},{name:"CLIENT_KEY_PATH",value:"/certs/client.key"}],
+                          volumeMounts:[{name:"cert",mountPath:"/certs",readOnly:true}]}]}}}}' | kubectl apply -f - >/dev/null
+                      if ! kubectl wait --for=condition=complete --timeout=300s "job/${job}" -n nico-system >/dev/null 2>&1; then
+                        echo "admin-cli ${name} failed: $(kubectl logs -n nico-system "job/${job}" --tail=5 2>/dev/null | tr '\n' ' ')" >&2; return 1
+                      fi
+                    }
+                    find_seg() { printf "SELECT id::text FROM network_segments WHERE name = '%s' AND deleted IS NULL;" "${SEG_NAME}" | sql | tr -d ' \r\n'; }
+                    segment() {
+                      local id sub
+                      id="$(find_seg)"; [[ -n "${id}" ]] && { echo "segment ${SEG_NAME} exists (${id})"; return 0; }
+                      sub="$(printf 'SELECT id::text FROM domains WHERE deleted IS NULL ORDER BY created LIMIT 1;' | sql | tr -d ' \r\n')"
+                      [[ -n "${sub}" ]] || { echo "no live DNS domain for the segment subdomain id" >&2; return 1; }
+                      # --cloud-unsafe-op is global and must precede the subcommand.
+                      cli seg-create --cloud-unsafe-op=nico-stack network-segment create --name "${SEG_NAME}" --segment-type host-inband \
+                        --prefix "${SEG_PREFIX}" --gateway "${SEG_GW}" --reserve-first "${SEG_RESERVE}" --subdomain-id "${sub}" || return 1
+                      id="$(find_seg)"; [[ -n "${id}" ]] || { echo "segment created but not found" >&2; return 1; }
+                      echo "created segment ${SEG_NAME} (${id})"
+                    }
+                    set -- ${BMC_IPS}; IPS=("$@"); i=0
+                    existing="$(printf 'SELECT bmc_mac_address::text FROM expected_machines;' | sql | tr 'A-Z' 'a-z')"
+                    for m in ${MACHINES}; do
+                      i=$((i + 1)); mac="$(printf '%s:%02x' "${BMC_MAC_PREFIX}" "${i}" | tr 'A-Z' 'a-z')"; data="$(printf '%s:%02x' "${DATA_MAC_PREFIX}" "$((i - 1))" | tr 'A-Z' 'a-z')"
+                      ip="${IPS[$((i - 1))]}"; serial="${SERIAL_PREFIX}${i}"
+                      if grep -qix "${mac}" <<<"${existing}"; then
+                        cli "em-patch-${i}" expected-machine patch --bmc-mac-address "${mac}" --bmc-username "${BMC_USER}" --bmc-password "${BMC_PASS}" --dpu-policy ignore && echo "${m}: patched" || echo "${m}: patch failed" >&2
+                        continue
+                      fi
+                      # The BMC stays out of --interfaces; --bmc-ip-address identifies it.
+                      cli "em-add-${i}" expected-machine add --bmc-mac-address "${mac}" --bmc-username "${BMC_USER}" --bmc-password "${BMC_PASS}" \
+                        --chassis-serial-number "${serial}" --bmc-ip-address "${ip}" --meta-name "${m}" \
+                        --interfaces "$(jq -nc --arg m "${data}" '[{mac_address:$m,role:"host",ip_allocation:"dynamic",network_segment_type:3,primary:true}]')" \
+                        --dpu-policy ignore --dpf-enabled false --disable-lockdown true --bmc-retain-credentials true \
+                        && echo "${m}: registered (bmc ${mac} at ${ip}, nic ${data})" || { echo "${m}: registration failed" >&2; exit 1; }
+                    done
+                    want="$(wc -w <<<"${MACHINES}")"; deadline=$(( $(date +%s) + WAIT )); last=""; stalls=0; round=0
+                    while :; do
+                      explored="$(count 'SELECT count(*) FROM explored_endpoints;')"; machines="$(count 'SELECT count(*) FROM machines;')"
+                      [[ "${machines:-0}" -ge "${want}" ]] && { echo "${want} machines ingested"; segment; exit 0; }
+                      if [[ "${explored}/${machines}" != "${last}" ]]; then echo "explored ${explored} BMCs, ingested ${machines} of ${want}"; last="${explored}/${machines}"; stalls=0; else stalls=$((stalls + 1)); fi
+                      if (( stalls >= 8 && round < 3 )); then
+                        round=$((round + 1)); stalls=0; echo "no progress, re-arming site-explorer (round ${round})"
+                        for ip in "${IPS[@]}"; do cli "se-clear-${round}" site-explorer clear-error "${ip}" || true; cli "se-refresh-${round}" site-explorer refresh "${ip}" || true; done
+                      fi
+                      (( $(date +%s) < deadline )) || break
+                      sleep 15
+                    done
+                    machines="$(count 'SELECT count(*) FROM machines;')"
+                    [[ "${machines:-0}" -gt 0 ]] || { echo "no machine ingested after ${WAIT}s" >&2; exit 1; }
+                    echo "only ${machines} of ${want} machines after ${WAIT}s" >&2
+                    segment
+---
+apiVersion: management.loft.sh/v1
+kind: App
+metadata:
+  name: nico-step-23-day0-rest
+  labels: {nico.vcluster.com/stack: "true"}
+spec:
+  displayName: "[NiCo 23] Day 0: instance type, site IP block, machine attachment"
+  description: Enables image-based OS on the site, creates the instance type and the site IP block a Platform NodeProvider needs, waits for Ready machines and attaches them. Ids land in Secret nico-rest/nico-day0 (task outputs).
+  defaultNamespace: nico-rest
+  wait: true
+  timeout: 40m
+  config:
+    manifests: |
+      {{- $n := .Release.Name }}
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata: {name: {{ $n }}, namespace: {{ .Release.Namespace }}}
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata: {name: nico-stack-{{ $n }}}
+      subjects: [{kind: ServiceAccount, name: {{ $n }}, namespace: {{ .Release.Namespace }}}]
+      roleRef: {kind: ClusterRole, name: cluster-admin, apiGroup: rbac.authorization.k8s.io}
+      ---
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: nico-day0
+        namespace: {{ .Release.Namespace }}
+      type: Opaque
+      ---
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: {{ $n }}-run
+        namespace: {{ .Release.Namespace }}
+        annotations:
+          "helm.sh/hook": post-install,post-upgrade
+          "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+      spec:
+        backoffLimit: 0
+        activeDeadlineSeconds: 2340
+        template:
+          spec:
+            serviceAccountName: {{ $n }}
+            restartPolicy: Never
+            containers:
+              - name: run
+                image: {{ .Values.hookImage | quote }}
+                env:
+                  - {name: SITE_ID, value: {{ .Values.siteId | quote }}}
+                  - {name: ORG, value: {{ .Values.org | quote }}}
+                  - {name: PLATFORM_NS, value: {{ .Values.platformNamespace | quote }}}
+                  - {name: LOFT_HOST, value: {{ .Values.loftHost | quote }}}
+                  - {name: REST_PORT, value: {{ .Values.restPort | quote }}}
+                  - {name: IT_NAME, value: {{ .Values.instanceTypeName | quote }}}
+                  - {name: IPB_NAME, value: {{ .Values.ipBlockName | quote }}}
+                  - {name: IPB_PREFIX, value: {{ .Values.ipBlockPrefix | quote }}}
+                  - {name: IPB_LEN, value: {{ .Values.ipBlockPrefixLength | quote }}}
+                  - {name: WANT, value: {{ .Values.machineNames | quote }}}
+                  - {name: WAIT, value: {{ .Values.machineWaitSeconds | default "1800" | quote }}}
+                command: [bash, -euo, pipefail, -c]
+                args:
+                  - |
+                    AUD="http://nico-rest-api.nico-rest.svc.cluster.local:${REST_PORT}"
+                    b64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+                    mint() {
+                      local now kid hdr pay sig
+                      kubectl -n "${PLATFORM_NS}" get secret loft-cert -o jsonpath='{.data.tls\.key}' | base64 -d > /tmp/key
+                      kid="$(curl -fsS "http://loft.${PLATFORM_NS}.svc.cluster.local/oidc/keys" | jq -r '.keys[0].kid')"
+                      now=$(date +%s)
+                      hdr="$(jq -nc --arg kid "${kid}" '{alg:"RS256",typ:"JWT",kid:$kid}' | b64)"
+                      pay="$(jq -nc --arg iss "https://${LOFT_HOST}/oidc" --arg sub "platform:provider:${ORG}" --arg aud "${AUD}" --arg org "${ORG}" \
+                        --argjson iat "${now}" --argjson exp "$((now + 3600))" \
+                        '{iss:$iss,sub:$sub,aud:[$aud],iat:$iat,nbf:$iat,exp:$exp,organization:$org,roles:["PROVIDER_ADMIN"]}' | b64)"
+                      sig="$(printf '%s.%s' "${hdr}" "${pay}" | openssl dgst -sha256 -sign /tmp/key | b64)"
+                      printf '%s.%s.%s' "${hdr}" "${pay}" "${sig}"
+                    }
+                    TOKEN="$(mint)"
+                    rest() { curl -sS --fail-with-body -X "$1" -H "Authorization: Bearer ${TOKEN}" -H 'Accept: application/json' -H 'Content-Type: application/json' ${3:+--data "$3"} "${AUD}/v2/org/${ORG}/nico$2"; }
+                    LIST='if type == "array" then . else (.items // .data // .sites // .results // []) end'
+                    if [[ "$(rest GET "/site/${SITE_ID}" | jq -r '.capabilities.imageBasedOperatingSystem // false')" != true ]]; then
+                      rest PATCH "/site/${SITE_ID}" '{"capabilities":{"imageBasedOperatingSystem":true}}' >/dev/null; echo "imageBasedOperatingSystem enabled"
+                    fi
+                    it="$(rest GET "/instance/type?siteId=${SITE_ID}" | jq -r --arg n "${IT_NAME}" "${LIST} | map(select(.name==\$n)) | .[0].id // empty")"
+                    # The API rejects a null machineCapabilities; an empty list is "any machine".
+                    [[ -n "${it}" ]] || it="$(rest POST /instance/type "$(jq -nc --arg n "${IT_NAME}" --arg s "${SITE_ID}" '{name:$n,siteId:$s,machineCapabilities:[]}')" | jq -r .id)"
+                    echo "instance type ${IT_NAME} = ${it}"
+                    ipb="$(rest GET "/ipblock?siteId=${SITE_ID}" | jq -r --arg n "${IPB_NAME}" "${LIST} | map(select(.name==\$n)) | .[0].id // empty")"
+                    [[ -n "${ipb}" ]] || ipb="$(rest POST /ipblock "$(jq -nc --arg n "${IPB_NAME}" --arg s "${SITE_ID}" --arg p "${IPB_PREFIX}" --argjson l "${IPB_LEN}" \
+                      '{name:$n,siteId:$s,routingType:"DatacenterOnly",prefix:$p,prefixLength:$l,protocolVersion:"IPv4"}')" | jq -r .id)"
+                    echo "ip block ${IPB_NAME} = ${ipb}"
+                    kubectl patch secret nico-day0 -n nico-rest -p "$(jq -nc --arg it "${it}" --arg ipb "${ipb}" '{stringData:{instanceTypeId:$it,ipBlockId:$ipb}}')"
+                    want="$(wc -w <<<"${WANT}")"; deadline=$(( $(date +%s) + WAIT )); last=""
+                    while :; do
+                      all="$(rest GET "/machine?siteId=${SITE_ID}")"
+                      ids="$(jq -r "[${LIST} | .[] | select(.status==\"Ready\" and .isUsableByTenant and ((.associatedDpuMachineIds // []) | length == 0)) | .id]" <<<"${all}")"
+                      n="$(jq length <<<"${ids}")"; inuse="$(jq -r "[${LIST} | .[] | select(.status==\"InUse\")] | length" <<<"${all}")"
+                      (( n + inuse >= want )) && break
+                      [[ "${n}" != "${last}" ]] && { echo "${n} of ${want} machines ready"; last="${n}"; }
+                      (( $(date +%s) < deadline )) || { echo "only ${n} of ${want} machines allocatable after ${WAIT}s" >&2; break; }
+                      TOKEN="$(mint)"; sleep 15
+                    done
+                    (( n > 0 )) || { echo "no allocatable machine to attach" >&2; exit 1; }
+                    # Attach and verify: a tenant allocation cannot be satisfied until machines carry the instance type.
+                    for i in $(seq 1 10); do
+                      out="$(rest POST "/instance/type/${it}/machine" "$(jq -nc --argjson m "${ids}" '{machineIds:$m}')" 2>&1)" || echo "attach: ${out:0:300}" >&2
+                      attached="$(rest GET "/machine?siteId=${SITE_ID}" | jq -r --arg it "${it}" "[${LIST} | .[] | select(.instanceTypeId==\$it)] | length")"
+                      (( attached >= n )) && { echo "${attached} machines attached to ${IT_NAME}"; exit 0; }
+                      TOKEN="$(mint)"; sleep 15
+                    done
+                    echo "only ${attached:-0} of ${n} machines attached to ${IT_NAME}" >&2; exit 1

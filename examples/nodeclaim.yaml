@@ -1,0 +1,17 @@
+# A machine claimed from the site. Not part of either stack: create and delete claims yourself.
+# nico-platform's teardown refuses to run while a claim still references the provider.
+apiVersion: management.loft.sh/v1
+kind: NodeClaim
+metadata:
+  name: nico-worker
+  namespace: p-default
+  labels:
+    tenant.platform.vcluster.com/name: nico-demo
+spec:
+  providerRef: nico
+  typeRef: nico.flat-demo-type
+  environmentRef: nico-flat
+  owner:
+    user: admin
+  properties:
+    vcluster.com/os-image: ubuntu-noble-nico
