@@ -75,9 +75,10 @@ child changed.
   substitutes it.
 - **Values are rendered with slim-sprig**: no `merge`, `dict` tricks or `until`.
 - **Max 20 tasks per template.** Four steps here do two jobs each.
-- **Editing an App does not redeploy existing instances.** Delete the child AppInstance (its
-  pre-delete hooks run) or wait for its retry (1, 5, 15 min). A failed chart install leaves the
-  objects it created; sweep by `meta.helm.sh/release-name` before the next attempt.
+- **Editing a catalog App redeploys the instances that reference it** (the controller watches
+  Apps and converges on the resolved config), and StackTemplate edits roll out on every reconcile.
+  Deleting a child AppInstance to force a redeploy runs its pre-delete hooks, so prefer the retry
+  annotation or an App edit. A failed first install is uninstalled before its retry.
 - **Password parameters make every task error "withheld"** in the stack status. Read the child
   AppInstance's message or its gzip log secret `loft-appinstance-log-<child>`.
 - **A templated `templateRef` name** (the certified Run:ai trick for conditional tasks) shows
