@@ -115,7 +115,7 @@ spec:
             spec:
               accessModes: [ReadWriteOnce]
               storageClassName: {{ .Values.storageClass | quote }}
-              resources: {requests: {storage: 1Gi}}
+              resources: {requests: {storage: 10Gi}} # NVIDIA's 1Gi fills with Temporal WAL in ~3 days
       ---
       apiVersion: v1
       kind: Secret

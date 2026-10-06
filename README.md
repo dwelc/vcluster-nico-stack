@@ -94,6 +94,10 @@ child changed.
   a tenant allocation can be satisfied; the day0rest task verifies the attachment.
 - Integer pool ranges in the site config are quoted strings, or nico-api fails to load it.
 - The Core chart expects a `forge-system` namespace it does not create.
+- NVIDIA's reference Postgres for the REST API and Temporal has a 1Gi volume; Temporal WAL fills
+  it in about three days, Postgres crash-loops on "No space left on device", every NiCo workflow
+  (including VPC delete, which blocks NetworkEnvironment teardown) then times out. The stack asks
+  for 10Gi; an existing install is fixed by expanding the PVC in place.
 - Temporal namespace registration lags `create` by minutes; verify with `describe`.
 - Tear down a non-stack install with `helm uninstall`, not namespace deletion: cluster-scoped
   RBAC, CRDs and objects in cert-manager survive and fail helm's ownership checks later.
